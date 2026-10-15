@@ -1,4 +1,5 @@
-# Founder
+# Founder <img width="1154" height="1010" alt="Flounder" src="https://github.com/user-attachments/assets/a4f41434-dda0-4f81-ac4e-fdb09c8f053d" />
+
 
 A macOS Finder clone written in Swift and AppKit.
 
