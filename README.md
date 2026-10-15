@@ -2,6 +2,8 @@
 
 A macOS Finder clone written in Swift and AppKit.
 
+<img width="953" height="591" alt="image" src="https://github.com/user-attachments/assets/09531259-cd11-44fb-9344-74b4d432fc78" />
+
 ## Features
 
 - Two-pane layout: favorites sidebar (left) and file browser (right) with Name, Size,
