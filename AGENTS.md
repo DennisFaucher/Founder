@@ -60,6 +60,18 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
 - Column sorting: set `sortDescriptorPrototype` on each `NSTableColumn` and implement
   `tableView(_:sortDescriptorsDidChange:)` on the data source; re-sort in place so it
   also works on async recursive-search results.
+- Symbolic links: `FileManager.contentsOfDirectory(at:)` fails with `ENOTDIR` ("Not a
+  directory") when the URL is a symlink to a directory. `loadDirectory` therefore
+  enumerates with `contentsOfDirectory(atPath:)` (which follows the link) and rebuilds
+  child URLs against the link, and uses `fileExists(atPath:isDirectory:)` (also
+  link-following) for the directory flag. Child `resourceValues` are read with `try?` so
+  one unreadable child (e.g. cloud-storage placeholders) can't blank the whole listing.
+- "Open in Finder" (file context menu): single directory → `NSWorkspace.open`, otherwise
+  `NSWorkspace.activateFileViewerSelecting`; no selection → opens the current directory.
+- Image thumbnails: `QLThumbnailGenerator` (QuickLookThumbnailing) with a per-URL cache;
+  only for files whose `UTType` conforms to `.image`. `viewFor` returns the generic
+  `NSWorkspace.icon` immediately and the async result triggers `onThumbnailReady`, which
+  reloads just that row (`reloadData(forRowIndexes:columnIndexes:)`).
 
 ## Conventions
 
@@ -73,9 +85,10 @@ Draft 0.1 is functional: browse, navigate (back/forward, Go menu, enclosing fold
 path bar), favorites with add/remove/reorder (drag & drop in the sidebar + Move Up/Down),
 open / open with / trash / delete / rename / info, cut-copy-paste, create folder/file,
 hidden files toggle, drag & drop (move/copy within the app and to/from Finder; drop
-onto a folder row to move into it), column sorting (click Name/Size/Date header to sort
-and click again to reverse; folders always grouped first), Quick Look (context menu item
-+ Spacebar; `QLPreviewPanel` with the app delegate as dataSource), and filtering search
+onto a folder row to move into it), "Open in Finder", column sorting (click Name/Size/Date
+header to sort and click again to reverse; folders always grouped first), Quick Look (context menu item
++ Spacebar; `QLPreviewPanel` with the app delegate as dataSource), image thumbnails in
+the Name column, and filtering search
 (current folder, plus a "Recursive" checkbox that searches subfolders when a query is
 present). Search runs on an explicit button/Enter (not live) and recursive traversal is
 async + cancellable with a spinner and live scan/match counts. The query is a

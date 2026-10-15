@@ -7,6 +7,8 @@
 
 import AppKit
 import Quartz
+import QuickLookThumbnailing
+import UniformTypeIdentifiers
 
 let favoriteRowPasteboardType = NSPasteboard.PasteboardType("com.dennisfaucher.founder.favoriteRow")
 
@@ -140,6 +142,14 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
                   let panel = QLPreviewPanel.shared(),
                   panel.isVisible else { return }
             panel.reloadData()
+        }
+        fileTreeDataSource.onThumbnailReady = { [weak self] url in
+            guard let self = self,
+                  let row = self.fileTreeDataSource.entries.firstIndex(of: url) else { return }
+            self.fileTreeTableView.reloadData(
+                forRowIndexes: IndexSet(integer: row),
+                columnIndexes: IndexSet(integer: 0)
+            )
         }
 
         // Periodic metadata refresh so external file edits (size/date) show up
@@ -668,6 +678,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         menu.addItem(withTitle: "Open With...", action: #selector(openWith), keyEquivalent: "")
         menu.addItem(withTitle: "Quick Look", action: #selector(toggleQuickLook(_:)), keyEquivalent: "")
         menu.addItem(withTitle: "Open Enclosing Folder", action: #selector(goToEnclosingFolder), keyEquivalent: "")
+        menu.addItem(withTitle: "Open in Finder", action: #selector(openInFinder), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Move to Trash", action: #selector(moveToTrash), keyEquivalent: "")
         menu.addItem(withTitle: "Delete Permanently...", action: #selector(deletePermanently), keyEquivalent: "")
@@ -1102,6 +1113,24 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         navigateTo(url: parent)
     }
 
+    @objc func openInFinder() {
+        let urls = selectedFileURLs
+        guard !urls.isEmpty else {
+            NSWorkspace.shared.open(fileTreeDataSource.currentDirectory)
+            return
+        }
+        // A single selected folder opens in Finder; files (or a multi-selection)
+        // are revealed and selected in their containing folder.
+        if urls.count == 1, let url = urls.first {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+                NSWorkspace.shared.open(url)
+                return
+            }
+        }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
     @objc func goToFolder() {
         let alert = NSAlert()
         alert.messageText = "Go to Folder"
@@ -1419,6 +1448,9 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var onSearchProgress: ((Int, Int) -> Void)?
     var onSearchFinished: (() -> Void)?
     var onSelectionChanged: (() -> Void)?
+    var onThumbnailReady: ((URL) -> Void)?
+    private var thumbnailCache: [URL: NSImage] = [:]
+    private var thumbnailRequests: Set<URL> = []
     private var directorySource: DispatchSourceFileSystemObject?
     private let searchQueue = DispatchQueue(label: "com.dennisfaucher.founder.search", qos: .userInitiated)
     private let stateLock = NSLock()
@@ -1440,11 +1472,6 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         attributeCache.removeAll()
 
         let fileManager = FileManager.default
-        let resourceKeys: [URLResourceKey] = [
-            .isDirectoryKey,
-            .isHiddenKey,
-            .nameKey,
-        ]
 
         let query = filterQuery.trimmingCharacters(in: .whitespaces)
 
@@ -1457,21 +1484,22 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
 
         do {
-            let contents = try fileManager.contentsOfDirectory(
-                at: url,
-                includingPropertiesForKeys: resourceKeys,
-                options: []
-            )
+            // `contentsOfDirectory(at:)` fails with ENOTDIR when `url` is a
+            // symbolic link to a directory, so enumerate by path (which follows
+            // the link) and rebuild child URLs against the link itself.
+            let names = try fileManager.contentsOfDirectory(atPath: url.path)
 
             var filtered: [(url: URL, isDir: Bool)] = []
             let pattern = compileSearchPattern(query)
-            for item in contents {
-                let values = try item.resourceValues(forKeys: Set(resourceKeys))
-                let name = item.lastPathComponent
-                let isHidden = values.isHidden ?? name.hasPrefix(".")
+            for name in names {
+                let item = url.appendingPathComponent(name)
+                let isHidden = name.hasPrefix(".") ||
+                    ((try? item.resourceValues(forKeys: [.isHiddenKey]))?.isHidden ?? false)
                 if !showHidden && isHidden { continue }
                 if !matchesSearchPattern(name, pattern: pattern) { continue }
-                filtered.append((item, values.isDirectory ?? false))
+                var isDir: ObjCBool = false
+                _ = fileManager.fileExists(atPath: item.path, isDirectory: &isDir)
+                filtered.append((item, isDir.boolValue))
             }
 
             filtered = sortedForDisplay(filtered)
@@ -1538,7 +1566,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         generation = searchGeneration
         stateLock.unlock()
 
-        let root = currentDirectory
+        let root = currentDirectory.resolvingSymlinksInPath()
         let includeHidden = showHidden
 
         entries = []
@@ -1571,8 +1599,9 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                     visited += 1
                     if visited >= maxVisited || matches.count >= maxResults { break }
                     guard matchesSearchPattern(item.lastPathComponent, pattern: pattern) else { continue }
-                    let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
-                    matches.append((item, isDir))
+                    var itemIsDir: ObjCBool = false
+                    _ = fm.fileExists(atPath: item.path, isDirectory: &itemIsDir)
+                    matches.append((item, itemIsDir.boolValue))
 
                     if visited - lastReported >= 250 {
                         lastReported = visited
@@ -1640,6 +1669,42 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]
         attributeCache[url] = attrs
         return attrs
+    }
+
+    // MARK: Thumbnails
+
+    private func isImageFile(_ url: URL) -> Bool {
+        guard let type = UTType(filenameExtension: url.pathExtension) else { return false }
+        return type.conforms(to: .image)
+    }
+
+    func thumbnail(for url: URL, isDir: Bool) -> NSImage? {
+        guard !isDir, isImageFile(url) else { return nil }
+        if let cached = thumbnailCache[url] { return cached }
+        requestThumbnail(for: url)
+        return nil
+    }
+
+    private func requestThumbnail(for url: URL) {
+        guard !thumbnailRequests.contains(url) else { return }
+        thumbnailRequests.insert(url)
+
+        let request = QLThumbnailGenerator.Request(
+            fileAt: url,
+            size: NSSize(width: 32, height: 32),
+            scale: 2.0,
+            representationTypes: .thumbnail
+        )
+        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] representation, _ in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.thumbnailRequests.remove(url)
+                guard let image = representation?.nsImage else { return }
+                if self.thumbnailCache.count > 500 { self.thumbnailCache.removeAll() }
+                self.thumbnailCache[url] = image
+                self.onThumbnailReady?(url)
+            }
+        }
     }
 
     private func size(for url: URL, isDir: Bool) -> Int64 {
@@ -1753,7 +1818,11 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             } else {
                 cell.textField?.textColor = .labelColor
             }
-            cell.imageView?.image = NSWorkspace.shared.icon(forFile: url.path)
+            if let thumbnail = thumbnail(for: url, isDir: isDir) {
+                cell.imageView?.image = thumbnail
+            } else {
+                cell.imageView?.image = NSWorkspace.shared.icon(forFile: url.path)
+            }
             return cell
 
         case "size":
