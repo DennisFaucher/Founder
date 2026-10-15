@@ -38,6 +38,11 @@ func matchesSearchPattern(_ name: String, pattern: SearchPattern) -> Bool {
     }
 }
 
+struct FavoriteEntry {
+    var path: String
+    var depth: Int
+}
+
 class FileTreeTableView: NSTableView {
     var onQuickLook: (() -> Void)?
 
@@ -705,12 +710,30 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         menu.addItem(.separator())
         menu.addItem(withTitle: "Move Up", action: #selector(moveFavoriteUp), keyEquivalent: "")
         menu.addItem(withTitle: "Move Down", action: #selector(moveFavoriteDown), keyEquivalent: "")
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Indent", action: #selector(indentFavorite), keyEquivalent: "")
+        menu.addItem(withTitle: "Unindent", action: #selector(unindentFavorite), keyEquivalent: "")
         return menu
     }
 
     // MARK: NSMenuDelegate — validation
 
     func menuNeedsUpdate(_ menu: NSMenu) {
+        if menu === favoritesListView.menu {
+            let index = favoriteActionRow
+            for item in menu.items {
+                switch item.action {
+                case #selector(indentFavorite):
+                    item.isEnabled = favoritesDataSource.canIndent(at: index)
+                case #selector(unindentFavorite):
+                    item.isEnabled = favoritesDataSource.canUnindent(at: index)
+                default:
+                    item.isEnabled = index >= 0
+                }
+            }
+            return
+        }
+
         guard menu === fileTreeTableView.menu else { return }
 
         // Ensure the clicked row becomes the primary selection before
@@ -746,7 +769,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Founder"
-        alert.informativeText = "A macOS Finder clone built with Swift.\nVersion 0.1 (draft)"
+        alert.informativeText = "A macOS Finder clone built with Swift.\nVersion 0.3 (draft)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -1049,7 +1072,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     @objc func openFavorite() {
         let index = favoritesListView.clickedRow >= 0 ? favoritesListView.clickedRow : favoritesListView.selectedRow
         guard index >= 0, index < favoritesDataSource.favorites.count else { return }
-        navigateTo(path: favoritesDataSource.favorites[index])
+        navigateTo(path: favoritesDataSource.favorites[index].path)
     }
 
     @objc func addToFavorites() {
@@ -1084,6 +1107,29 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         favoritesDataSource.move(from: index, to: index + 1)
         favoritesListView.reloadData()
         favoritesListView.selectRowIndexes(IndexSet(integer: index + 1), byExtendingSelection: false)
+    }
+
+    /// Row the favorites context-menu actions should target: the right-clicked
+    /// row when there is one, otherwise the current selection.
+    var favoriteActionRow: Int {
+        let clicked = favoritesListView.clickedRow
+        return clicked >= 0 ? clicked : favoritesListView.selectedRow
+    }
+
+    @objc func indentFavorite() {
+        let index = favoriteActionRow
+        guard favoritesDataSource.canIndent(at: index) else { NSSound.beep(); return }
+        favoritesDataSource.indent(at: index)
+        favoritesListView.reloadData()
+        favoritesListView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+    }
+
+    @objc func unindentFavorite() {
+        let index = favoriteActionRow
+        guard favoritesDataSource.canUnindent(at: index) else { NSSound.beep(); return }
+        favoritesDataSource.unindent(at: index)
+        favoritesListView.reloadData()
+        favoritesListView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
     }
 
     // MARK: Actions — View & Go
@@ -1231,10 +1277,13 @@ private final class OpenWithContext: NSObject {
 // MARK: - Favorites Data Source
 
 class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
-    var favorites: [String] = []
+    var favorites: [FavoriteEntry] = []
     var onSelect: ((String) -> Void)?
     var onFilesDropped: ((URL, [URL], Bool) -> Void)?
     private var suppressSelectionCallback = false
+
+    /// Horizontal offset applied per nesting level, in points.
+    static let indentWidth: CGFloat = 14
 
     override init() {
         super.init()
@@ -1242,8 +1291,17 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     }
 
     func loadFavorites() {
-        if let saved = UserDefaults.standard.stringArray(forKey: "favorites") {
-            favorites = saved
+        let defaults = UserDefaults.standard
+        if let saved = defaults.array(forKey: "favorites") as? [[String: Any]] {
+            favorites = saved.compactMap { dict in
+                guard let path = dict["path"] as? String else { return nil }
+                let depth = dict["depth"] as? Int ?? 0
+                return FavoriteEntry(path: path, depth: max(0, depth))
+            }
+        } else if let legacy = defaults.stringArray(forKey: "favorites") {
+            // Migrate the original flat array of path strings.
+            favorites = legacy.map { FavoriteEntry(path: $0, depth: 0) }
+            saveFavorites()
         } else {
             let home = FileManager.default.homeDirectoryForCurrentUser.path
             favorites = [
@@ -1253,18 +1311,19 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
                 home + "/Movies",
                 home + "/Music",
                 home + "/Pictures",
-            ]
+            ].map { FavoriteEntry(path: $0, depth: 0) }
             saveFavorites()
         }
     }
 
     func saveFavorites() {
-        UserDefaults.standard.set(favorites, forKey: "favorites")
+        let stored = favorites.map { ["path": $0.path, "depth": $0.depth] as [String: Any] }
+        UserDefaults.standard.set(stored, forKey: "favorites")
     }
 
     func add(path: String) {
-        guard !favorites.contains(path) else { return }
-        favorites.append(path)
+        guard !favorites.contains(where: { $0.path == path }) else { return }
+        favorites.append(FavoriteEntry(path: path, depth: 0))
         saveFavorites()
     }
 
@@ -1281,8 +1340,47 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         saveFavorites()
     }
 
+    // MARK: Nesting
+
+    /// Whether the item at `index` can be nested one level deeper. Follows the
+    /// classic outliner rule: a row may sit at most one level deeper than the row
+    /// directly above it. Depth is purely cosmetic — it is not checked against the
+    /// filesystem.
+    func canIndent(at index: Int) -> Bool {
+        guard index > 0, favorites.indices.contains(index) else { return false }
+        return favorites[index].depth < favorites[index - 1].depth + 1
+    }
+
+    func canUnindent(at index: Int) -> Bool {
+        favorites.indices.contains(index) && favorites[index].depth > 0
+    }
+
+    func indent(at index: Int) {
+        guard canIndent(at: index) else { return }
+        shift(at: index, by: 1)
+    }
+
+    func unindent(at index: Int) {
+        guard canUnindent(at: index) else { return }
+        shift(at: index, by: -1)
+    }
+
+    /// Moves the row at `index` by `levels` and drags its subtree (the following
+    /// rows deeper than it) along, so structure is preserved.
+    private func shift(at index: Int, by levels: Int) {
+        let oldDepth = favorites[index].depth
+        guard oldDepth + levels >= 0 else { return }
+        favorites[index].depth = oldDepth + levels
+        var i = index + 1
+        while i < favorites.count, favorites[i].depth > oldDepth {
+            favorites[i].depth += levels
+            i += 1
+        }
+        saveFavorites()
+    }
+
     func displayName(at index: Int) -> String {
-        let path = favorites[index]
+        let path = favorites[index].path
         let name = (path as NSString).lastPathComponent
         if name.isEmpty {
             return (path as NSString).abbreviatingWithTildeInPath
@@ -1332,9 +1430,16 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         }
 
         cell.textField?.stringValue = displayName(at: row)
-        let expanded = (favorites[row] as NSString).expandingTildeInPath
+        let expanded = (favorites[row].path as NSString).expandingTildeInPath
         cell.imageView?.image = NSWorkspace.shared.icon(forFile: expanded)
         cell.imageView?.frame.size = NSSize(width: 16, height: 16)
+
+        // Indent nested favorites.
+        if let leading = cell.constraints.first(where: {
+            $0.firstAttribute == .leading && ($0.firstItem as? NSImageView) === cell.imageView
+        }) {
+            leading.constant = 6 + CGFloat(favorites[row].depth) * FavoritesDataSource.indentWidth
+        }
         return cell
     }
 
@@ -1342,7 +1447,7 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         guard !suppressSelectionCallback else { return }
         let tableView = notification.object as? NSTableView
         guard let row = tableView?.selectedRow, row >= 0, row < favorites.count else { return }
-        onSelect?(favorites[row])
+        onSelect?(favorites[row].path)
     }
 
     // MARK: Drag & drop — reorder
@@ -1413,7 +1518,7 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
 
     private func folderFavorite(at row: Int) -> URL? {
         guard favorites.indices.contains(row) else { return nil }
-        let url = URL(fileURLWithPath: (favorites[row] as NSString).expandingTildeInPath)
+        let url = URL(fileURLWithPath: (favorites[row].path as NSString).expandingTildeInPath)
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
             return nil

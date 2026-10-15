@@ -33,7 +33,12 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
    navigation history, clipboard, and all `@objc` action methods (menu bar + context menus
    dispatch to it through the responder chain — keep actions `@objc` on the delegate).
 3. **`FavoritesDataSource`** — favorites list backed by `UserDefaults` key `favorites`
-   (array of absolute path strings). `onSelect` closure navigates on click.
+   (array of `{path, depth}` dictionaries; a legacy array of path strings is migrated on
+   load). `depth` drives sidebar indentation. `onSelect` closure navigates on click.
+   Nesting (context-menu Indent/Unindent) follows the classic outliner rule: a row may sit
+   at most one level deeper than the row directly above it (`canIndent`), and indent/
+   unindent drag the subtree along (`shift`). Depth is purely cosmetic — not validated
+   against the filesystem.
 4. **`FileTreeDataSource`** — loads real directory contents via `FileManager` into
    `entries: [URL]`; supports hidden-file toggle; caches `FileAttributeKey` attributes
    per URL for size/date columns.
@@ -82,7 +87,8 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
 ## Status / TODO
 
 Draft 0.1 is functional: browse, navigate (back/forward, Go menu, enclosing folder,
-path bar), favorites with add/remove/reorder (drag & drop in the sidebar + Move Up/Down),
+path bar), favorites with add/remove/reorder (drag & drop in the sidebar + Move Up/Down)
+and nesting (context-menu Indent/Unindent, classic outliner rule as described above),
 open / open with / trash / delete / rename / info, cut-copy-paste, create folder/file,
 hidden files toggle, drag & drop (move/copy within the app and to/from Finder; drop
 onto a folder row to move into it), "Open in Finder", column sorting (click Name/Size/Date
