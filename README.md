@@ -5,7 +5,7 @@
 
 A macOS Finder clone written in Swift and AppKit.
 
-<img width="1258" height="891" alt="Screenshot 2026-10-15 at 5 13 31 PM" src="https://github.com/user-attachments/assets/e429a8d9-3428-4f9c-ad3d-daca4bdaf4c0" />
+<img width="1256" height="797" alt="Screenshot 2026-10-16 at 10 36 04 AM" src="https://github.com/user-attachments/assets/70562769-19e8-4c21-b743-69c9a9d86150" />
 
 ## Features
 
