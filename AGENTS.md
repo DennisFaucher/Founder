@@ -83,6 +83,22 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   (`navigateTo` sends non-directories to `NSWorkspace.open`) and can't be drop targets.
   `isPackage` resolves symlinks first — `/Applications/Safari.app` is a link and the flag
   isn't reported for the link itself. Want to browse a bundle's innards? Use Open in Finder.
+- Top-level `let`s in `main.swift` (e.g. the fuzzy scoring weights) are initialised as
+  part of the executable's top-level code, so they read as zero for anything that
+  `@testable import`s the module — i.e. the tests — even though the app is fine. Put such
+  constants on a type (e.g. `enum FuzzyScoring { static let match = 16 }`), which is
+  initialised lazily and works in both contexts.
+- Long names wrap *and* then get clipped by the 24 pt row: `NSTextField` needs
+  `usesSingleLineMode = true`, `maximumNumberOfLines = 1` (and `cell.wraps = false`) to
+  truncate rather than wrap. Worse, an **attributed** string carries its own paragraph
+  style, so `highlightedName` was wrapping every fuzzy-search result (those are the rows
+  that are highlighted) even though the plain `stringValue` path truncated fine — the
+  paragraph style has to be set explicitly. `allowsExpansionToolTips` (on `NSControl`)
+  makes the `url.path` tooltip show in full instead of being cut off itself; relative
+  paths in the Name column during a recursive search routinely need 600 pt+.
+- `relativeName(for:base:)` builds its prefix from `base` alone, because `base` already
+  ends in `/` when a search is rooted at `/` — appending another `/` compared against
+  `//` and silently degraded every row to its bare file name.
 
 ## Conventions
 
@@ -108,9 +124,28 @@ Quick Look (context menu item
 the Name column, and filtering search
 (current folder, plus a "Recursive" checkbox that searches subfolders when a query is
 present). Search runs on an explicit button/Enter (not live) and recursive traversal is
-async + cancellable with a spinner and live scan/match counts. The query is a
-case-insensitive regular expression (compiled once per search via `compileSearchPattern`
-/ `matchesSearchPattern`; plain substrings still match because regex is unanchored).
-Invalid patterns surface an inline error instead of running the search.
+async + cancellable with a spinner and live scan/match counts. The status line reports
+items **scanned**, not just matches (a match-gated report left it stuck on "Searching…"
+for selective queries), and it deliberately stays on screen after the search with the
+totals ("5,000 found of 5,401 scanned · 406 ms", or just "N found of M scanned" for a
+plain filtered listing, "Search cancelled · N found" after Cancel) — a fuzzy crawl over a
+big tree finishes in a couple of hundred milliseconds, so hiding the line on completion
+meant it flashed by unreadably. `onSearchFinished` therefore carries
+`(scanned, found, elapsed, cancelled)` and `lastScannedCount` holds the plain-listing
+count. The recursive results also reload the table themselves
+(`onDirectoryChanged?()`) — otherwise they only appeared when the 2 s metadata timer
+fired — and `isCrawling` makes `watchDirectory` ignore events while a crawl is running,
+so a crawl rooted at a busy directory (cloud sync, caches) no longer restarts itself.
+The query is fuzzy,
+fzf-style (`FuzzyQuery` / `fuzzySubsequenceMatch` in main.swift): whitespace-separated
+terms that must all match, with `!` to exclude, `'` for an exact substring, `^`/`$` to
+anchor, and smart-case (a term containing an uppercase letter matches case-sensitively).
+There is no invalid input, so no error path. Matches are scored (word/camelCase
+boundaries and consecutive runs score higher, gaps are penalised) and the list is ranked
+best-first whenever a query is active — the column sort only breaks ties. Matched
+characters are highlighted in the Name column via `matchPositions` +
+`highlightedName`; the "?" button next to the search field (`showSearchSyntax`) explains
+the syntax. Note the search matches `displayName(for:)` (the relative path while
+recursively searching) so highlight offsets line up with the rendered row.
 Possible next steps: drop files onto a sidebar favorite to move them there, column/icon
 view modes, better Get Info window, status bar.

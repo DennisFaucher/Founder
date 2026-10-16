@@ -12,30 +12,171 @@ import UniformTypeIdentifiers
 
 let favoriteRowPasteboardType = NSPasteboard.PasteboardType("com.dennisfaucher.founder.favoriteRow")
 
-enum SearchPattern {
-    case all
-    case regex(NSRegularExpression)
-    case invalid
+// MARK: - Fuzzy search (fzf-style)
+
+struct FuzzyMatch {
+    var score: Int
+    var positions: [Int]
 }
 
-func compileSearchPattern(_ query: String) -> SearchPattern {
-    if query.isEmpty { return .all }
-    guard let regex = try? NSRegularExpression(pattern: query, options: [.caseInsensitive]) else {
-        return .invalid
-    }
-    return .regex(regex)
+/// One whitespace-separated piece of a query. `exact`/`fromStart`/`toEnd` mark
+/// the non-fuzzy anchor operators (`'`, `^`, `$`); `negate` is the `!` prefix.
+private struct FuzzyTerm {
+    var negate = false
+    var exact = false
+    var fromStart = false
+    var toEnd = false
+    var text = ""
+    var caseSensitive = false
 }
 
-func matchesSearchPattern(_ name: String, pattern: SearchPattern) -> Bool {
-    switch pattern {
-    case .all:
-        return true
-    case .invalid:
-        return false
-    case .regex(let regex):
-        let range = NSRange(name.startIndex..<name.endIndex, in: name)
-        return regex.firstMatch(in: name, options: [], range: range) != nil
+/// A query in the spirit of fzf's search syntax: whitespace-separated terms that
+/// must all match (AND). A term may be prefixed with `!` to exclude matches and
+/// `'` for an exact substring, `^` to anchor at the start, or suffixed with `$`
+/// to anchor at the end. Terms containing an uppercase letter match
+/// case-sensitively; everything else is case-insensitive.
+struct FuzzyQuery {
+    private var terms: [FuzzyTerm] = []
+
+    var isEmpty: Bool { terms.isEmpty }
+
+    init(_ raw: String) {
+        for token in raw.split(whereSeparator: { $0.isWhitespace }) {
+            var term = FuzzyTerm()
+            var text = String(token)
+            if text.hasPrefix("!") {
+                term.negate = true
+                text.removeFirst()
+            }
+            if text.hasPrefix("'") {
+                term.exact = true
+                text.removeFirst()
+            } else {
+                if text.hasPrefix("^") {
+                    term.fromStart = true
+                    text.removeFirst()
+                }
+                if text.count > 1, text.hasSuffix("$") {
+                    term.toEnd = true
+                    text.removeLast()
+                }
+            }
+            guard !text.isEmpty else { continue }
+            term.text = text
+            term.caseSensitive = text.contains { $0.isUppercase }
+            terms.append(term)
+        }
     }
+
+    /// Returns the combined score and highlighted character offsets when every
+    /// term matches, or nil when any required term misses or any `!` term hits.
+    func match(_ candidate: String) -> FuzzyMatch? {
+        var score = 0
+        var positions: Set<Int> = []
+        for term in terms {
+            let result = matchTerm(term, candidate: candidate)
+            if term.negate {
+                if result != nil { return nil }
+                continue
+            }
+            guard let result = result else { return nil }
+            score += result.score
+            positions.formUnion(result.positions)
+        }
+        return FuzzyMatch(score: score, positions: positions.sorted())
+    }
+
+    private func matchTerm(_ term: FuzzyTerm, candidate: String) -> FuzzyMatch? {
+        if term.exact || term.fromStart || term.toEnd {
+            return anchoredMatch(term, candidate: candidate)
+        }
+
+        let original = Array(candidate)
+        let folded = Array(candidate.lowercased())
+        let query = Array(term.caseSensitive ? term.text : term.text.lowercased())
+        if term.caseSensitive || folded.count != original.count {
+            return fuzzySubsequenceMatch(query: query, candidate: original, original: original)
+        }
+        return fuzzySubsequenceMatch(query: query, candidate: folded, original: original)
+    }
+
+    private func anchoredMatch(_ term: FuzzyTerm, candidate: String) -> FuzzyMatch? {
+        var options: String.CompareOptions = term.caseSensitive ? [] : [.caseInsensitive]
+        if term.fromStart || term.toEnd { options.insert(.anchored) }
+        // `.anchored` alone pins the start; adding `.backwards` also pins the
+        // end, so `^foo$` requires the whole string to equal the term.
+        if term.toEnd { options.insert(.backwards) }
+        guard let range = candidate.range(of: term.text, options: options) else { return nil }
+        let start = candidate.distance(from: candidate.startIndex, to: range.lowerBound)
+        let length = candidate.distance(from: range.lowerBound, to: range.upperBound)
+        var score = FuzzyScoring.match * length
+        if start == 0 { score += FuzzyScoring.boundary }
+        return FuzzyMatch(score: score, positions: Array(start..<(start + length)))
+    }
+}
+
+/// Scoring weights, fzf-inspired. These live in a type rather than as file-scope
+/// `let`s on purpose: top-level `let`s in main.swift are initialised as part of
+/// the executable's top-level code, so they stay zero for anyone that imports
+/// the module (e.g. the test bundle) instead of running the app.
+private enum FuzzyScoring {
+    static let match = 16
+    static let gapStart = -3
+    static let gapExtension = -1
+    static let boundary = 8
+    static let camel = 7
+    static let consecutive = 8
+}
+
+/// Greedy fzf-style fuzzy match: every character of `query` must appear in
+/// `candidate` in order. Prefers word and camelCase boundaries and consecutive
+/// runs, and penalises gaps. `candidate` may be a lowercased copy of
+/// `original`, which is used to classify characters.
+private func fuzzySubsequenceMatch(query: [Character], candidate: [Character], original: [Character]) -> FuzzyMatch? {
+    guard !query.isEmpty, candidate.count >= query.count else { return nil }
+
+    var score = 0
+    var queryIndex = 0
+    var previousMatch = -1
+    var consecutive = 0
+    var positions: [Int] = []
+
+    for index in candidate.indices {
+        if queryIndex == query.count { break }
+        guard candidate[index] == query[queryIndex] else { continue }
+
+        score += FuzzyScoring.match
+
+        if previousMatch >= 0, index - previousMatch > 1 {
+            let gap = index - previousMatch - 1
+            score += FuzzyScoring.gapStart + FuzzyScoring.gapExtension * (gap - 1)
+            consecutive = 0
+        }
+
+        var bonus = 0
+        if index == 0 {
+            bonus = FuzzyScoring.boundary
+        } else {
+            let previous = original[index - 1]
+            if !previous.isLetter && !previous.isNumber {
+                bonus = FuzzyScoring.boundary
+            } else if previous.isNumber != original[index].isNumber {
+                bonus = FuzzyScoring.camel
+            } else if original[index].isUppercase {
+                bonus = FuzzyScoring.camel
+            }
+        }
+        if consecutive > 0 { bonus = max(bonus, FuzzyScoring.consecutive) }
+        score += bonus
+
+        consecutive += 1
+        previousMatch = index
+        positions.append(index)
+        queryIndex += 1
+    }
+
+    guard queryIndex == query.count else { return nil }
+    return FuzzyMatch(score: score, positions: positions)
 }
 
 struct FavoriteEntry {
@@ -106,6 +247,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     var pathControl: NSPathControl!
     var searchField: NSSearchField!
     var searchButton: NSButton!
+    var searchHelpButton: NSButton!
     var recursiveCheckbox: NSButton!
     var searchStatusView: NSView!
     var searchSpinner: NSProgressIndicator!
@@ -145,12 +287,10 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
         fileTreeDataSource.onSearchProgress = { [weak self] visited, matches in
             guard let self = self else { return }
-            let items = NumberFormatter.localizedString(from: NSNumber(value: visited), number: .decimal)
-            let found = NumberFormatter.localizedString(from: NSNumber(value: matches), number: .decimal)
-            self.searchStatusLabel.stringValue = "Searching… \(items) items scanned · \(found) found"
+            self.searchStatusLabel.stringValue = "Searching… \(Self.formattedCount(visited)) items scanned · \(Self.formattedCount(matches)) found"
         }
-        fileTreeDataSource.onSearchFinished = { [weak self] in
-            self?.hideSearchStatus()
+        fileTreeDataSource.onSearchFinished = { [weak self] scanned, found, elapsed, cancelled in
+            self?.showSearchResult(scanned: scanned, found: found, elapsed: elapsed, cancelled: cancelled)
         }
         fileTreeDataSource.onSelectionChanged = {
             guard QLPreviewPanel.sharedPreviewPanelExists(),
@@ -288,19 +428,22 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
         let nameColumn = NSTableColumn(identifier: .init("name"))
         nameColumn.title = "Name"
-        nameColumn.width = 320
+        nameColumn.width = 400
+        nameColumn.minWidth = 160
         nameColumn.sortDescriptorPrototype = NSSortDescriptor(key: "name", ascending: true)
         fileTreeTableView.addTableColumn(nameColumn)
 
         let sizeColumn = NSTableColumn(identifier: .init("size"))
         sizeColumn.title = "Size"
         sizeColumn.width = 90
+        sizeColumn.minWidth = 70
         sizeColumn.sortDescriptorPrototype = NSSortDescriptor(key: "size", ascending: true)
         fileTreeTableView.addTableColumn(sizeColumn)
 
         let dateColumn = NSTableColumn(identifier: .init("date"))
         dateColumn.title = "Date Modified"
         dateColumn.width = 160
+        dateColumn.minWidth = 130
         dateColumn.sortDescriptorPrototype = NSSortDescriptor(key: "date", ascending: true)
         fileTreeTableView.addTableColumn(dateColumn)
 
@@ -330,7 +473,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
         searchField = NSSearchField()
         searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.placeholderString = "Search"
+        searchField.placeholderString = "Search (fuzzy)"
         searchField.sendsSearchStringImmediately = false
         searchField.sendsWholeSearchString = true
         searchField.delegate = self
@@ -340,6 +483,11 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         searchButton = NSButton(title: "Search", target: self, action: #selector(performSearch))
         searchButton.translatesAutoresizingMaskIntoConstraints = false
         searchButton.bezelStyle = .rounded
+
+        searchHelpButton = NSButton(title: "?", target: self, action: #selector(showSearchSyntax))
+        searchHelpButton.translatesAutoresizingMaskIntoConstraints = false
+        searchHelpButton.bezelStyle = .circular
+        searchHelpButton.toolTip = "Fuzzy search syntax"
 
         recursiveCheckbox = NSButton(
             checkboxWithTitle: "Recursive",
@@ -376,6 +524,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
         view.addSubview(searchField)
         view.addSubview(searchButton)
+        view.addSubview(searchHelpButton)
         view.addSubview(recursiveCheckbox)
         searchStatusHeightConstraint = searchStatusView.heightAnchor.constraint(equalToConstant: 0)
         view.addSubview(searchStatusView)
@@ -390,7 +539,10 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
             searchButton.leadingAnchor.constraint(equalTo: searchField.trailingAnchor, constant: 8),
             searchButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
 
-            recursiveCheckbox.leadingAnchor.constraint(equalTo: searchButton.trailingAnchor, constant: 8),
+            searchHelpButton.leadingAnchor.constraint(equalTo: searchButton.trailingAnchor, constant: 6),
+            searchHelpButton.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
+
+            recursiveCheckbox.leadingAnchor.constraint(equalTo: searchHelpButton.trailingAnchor, constant: 8),
             recursiveCheckbox.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -8),
             recursiveCheckbox.centerYAnchor.constraint(equalTo: searchField.centerYAnchor),
 
@@ -431,17 +583,47 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         fileTreeDataSource.filterQuery = searchField.stringValue
         let query = searchField.stringValue.trimmingCharacters(in: .whitespaces)
 
-        if !query.isEmpty, case .invalid = compileSearchPattern(query) {
-            hideSearchStatus()
-            showSearchError("Invalid regular expression — use \" .* \" for any characters")
-            return
-        }
-
-        if !(fileTreeDataSource.recursiveSearch && !query.isEmpty) {
+        let recursive = fileTreeDataSource.recursiveSearch && !query.isEmpty
+        if !recursive {
             hideSearchStatus()
         }
         fileTreeDataSource.loadDirectory(fileTreeDataSource.currentDirectory)
         fileTreeTableView.reloadData()
+        if !recursive, !query.isEmpty {
+            // Not a recursive scan, so there's no crawl to time or cancel, but the
+            // summary line still reports what the query matched.
+            showSearchResult(
+                scanned: fileTreeDataSource.lastScannedCount,
+                found: fileTreeDataSource.entries.count,
+                elapsed: nil,
+                cancelled: false
+            )
+        }
+    }
+
+    @objc func showSearchSyntax() {
+        let alert = NSAlert()
+        alert.messageText = "Fuzzy Search"
+        alert.informativeText = """
+            Type one or more terms; every term must match (fuzzy, so letters just \
+            have to appear in order). Results are ranked by match quality, best first.
+
+              rfp          matches "ReserveForPlan.pdf"
+              pr rfp       all terms must match
+              'report      exact substring
+              ^2025        must start with
+              .pdf$        must end with
+              !archive     exclude matches
+
+            Terms with an uppercase letter are matched case-sensitively; \
+            everything else ignores case.
+            """
+        alert.addButton(withTitle: "OK")
+        if let window = window {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     @objc func cancelSearch() {
@@ -459,23 +641,47 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         searchButton.isEnabled = false
     }
 
+    /// Shown once a search is done. The line deliberately stays put: a fuzzy crawl
+    /// over a big tree can take a couple of hundred milliseconds, which is enough
+    /// to flash the "Searching…" line by without ever being readable. `elapsed` is
+    /// nil for a plain filtered listing, which has no crawl to time.
+    func showSearchResult(scanned: Int, found: Int, elapsed: TimeInterval?, cancelled: Bool) {
+        searchSpinner.stopAnimation(nil)
+        searchSpinner.isHidden = true
+        cancelSearchButton.isHidden = true
+        searchStatusLabel.textColor = .secondaryLabelColor
+
+        let foundText = Self.formattedCount(found)
+        if cancelled {
+            searchStatusLabel.stringValue = "Search cancelled · \(foundText) found"
+        } else if scanned > found {
+            let counts = "\(foundText) found of \(Self.formattedCount(scanned)) scanned"
+            searchStatusLabel.stringValue = elapsed.map { counts + " · " + Self.formattedDuration($0) } ?? counts
+        } else {
+            searchStatusLabel.stringValue = found == 1 ? "1 match" : "\(foundText) matches"
+        }
+
+        searchStatusView.isHidden = false
+        searchStatusHeightConstraint.constant = 20
+        searchButton.isEnabled = true
+    }
+
+    static func formattedCount(_ value: Int) -> String {
+        NumberFormatter.localizedString(from: NSNumber(value: value), number: .decimal)
+    }
+
+    static func formattedDuration(_ elapsed: TimeInterval) -> String {
+        elapsed < 1 ? String(format: "%.0f ms", elapsed * 1000) : String(format: "%.1f s", elapsed)
+    }
+
     func hideSearchStatus() {
         searchSpinner.stopAnimation(nil)
+        searchSpinner.isHidden = true
+        cancelSearchButton.isHidden = true
         searchStatusLabel.textColor = .secondaryLabelColor
         searchStatusHeightConstraint.constant = 0
         searchStatusView.isHidden = true
         searchStatusLabel.stringValue = ""
-        searchButton.isEnabled = true
-    }
-
-    func showSearchError(_ message: String) {
-        searchSpinner.stopAnimation(nil)
-        searchSpinner.isHidden = true
-        cancelSearchButton.isHidden = true
-        searchStatusLabel.textColor = .systemRed
-        searchStatusLabel.stringValue = message
-        searchStatusView.isHidden = false
-        searchStatusHeightConstraint.constant = 20
         searchButton.isEnabled = true
     }
 
@@ -782,7 +988,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Founder"
-        alert.informativeText = "A macOS Finder clone built with Swift.\nVersion 0.4 (draft)"
+        alert.informativeText = "A macOS Finder clone built with Swift.\nVersion 0.5 (draft)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -1571,6 +1777,12 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var attributeCache: [URL: [FileAttributeKey: Any]] = [:]
     var filterQuery: String = ""
     var recursiveSearch = false
+    /// The parsed form of `filterQuery`, and the per-URL score/offsets from the
+    /// last search. While a query is active the list is ranked by match score
+    /// instead of by the column sort.
+    private(set) var activeQuery = FuzzyQuery("")
+    private var matchScores: [URL: Int] = [:]
+    private var matchPositions: [URL: [Int]] = [:]
     var sortKey: String {
         didSet { UserDefaults.standard.set(sortKey, forKey: "sortKey") }
     }
@@ -1585,7 +1797,16 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var onDirectoryChanged: (() -> Void)?
     var onSearchStarted: (() -> Void)?
     var onSearchProgress: ((Int, Int) -> Void)?
-    var onSearchFinished: (() -> Void)?
+    /// Called with `scanned`, `found`, elapsed seconds and whether the crawl was
+    /// cancelled, so the UI can leave a summary on screen.
+    var onSearchFinished: ((_ scanned: Int, _ found: Int, _ elapsed: TimeInterval, _ cancelled: Bool) -> Void)?
+    /// Number of directory entries the last (non-recursive) listing looked at, so
+    /// a filtered listing can still report "N matches of M scanned".
+    private(set) var lastScannedCount = 0
+    private var searchStartTime = Date()
+    /// True while a recursive crawl is running, so directory-watcher events can be
+    /// ignored instead of restarting the crawl.
+    private var isCrawling = false
     var onSelectionChanged: (() -> Void)?
     var onThumbnailReady: ((URL) -> Void)?
     private var thumbnailCache: [URL: NSImage] = [:]
@@ -1618,6 +1839,9 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let fileManager = FileManager.default
 
         let query = filterQuery.trimmingCharacters(in: .whitespaces)
+        activeQuery = FuzzyQuery(query)
+        matchScores.removeAll()
+        matchPositions.removeAll()
 
         if recursiveSearch && !query.isEmpty {
             beginRecursiveSearch()
@@ -1625,6 +1849,8 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
 
         invalidateSearch()
+        // Any crawl has been superseded by this plain listing.
+        isCrawling = false
 
 
         do {
@@ -1632,15 +1858,19 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             // symbolic link to a directory, so enumerate by path (which follows
             // the link) and rebuild child URLs against the link itself.
             let names = try fileManager.contentsOfDirectory(atPath: url.path)
+            lastScannedCount = names.count
 
             var filtered: [(url: URL, isDir: Bool)] = []
-            let pattern = compileSearchPattern(query)
             for name in names {
                 let item = url.appendingPathComponent(name)
                 let isHidden = name.hasPrefix(".") ||
                     ((try? item.resourceValues(forKeys: [.isHiddenKey]))?.isHidden ?? false)
                 if !showHidden && isHidden { continue }
-                if !matchesSearchPattern(name, pattern: pattern) { continue }
+                if !activeQuery.isEmpty {
+                    guard let match = activeQuery.match(name) else { continue }
+                    matchScores[item] = match.score
+                    matchPositions[item] = match.positions
+                }
                 var isDir: ObjCBool = false
                 _ = fileManager.fileExists(atPath: item.path, isDirectory: &isDir)
                 filtered.append((item, isDir.boolValue && !isPackage(item)))
@@ -1672,6 +1902,9 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         )
         source.setEventHandler { [weak self] in
             guard let self = self else { return }
+            // A crawl watching its own root would restart on every write anywhere
+            // under it (cloud sync, caches, …), so let the in-flight one finish.
+            guard !self.isCrawling else { return }
             guard FileManager.default.fileExists(atPath: self.currentDirectory.path) else {
                 self.directorySource?.cancel()
                 self.directorySource = nil
@@ -1700,9 +1933,10 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     // MARK: Recursive search (async, cancellable)
 
     func beginRecursiveSearch() {
-        let query = filterQuery.trimmingCharacters(in: .whitespaces)
-        guard recursiveSearch, !query.isEmpty else { return }
-        let pattern = compileSearchPattern(query)
+        let rawQuery = filterQuery.trimmingCharacters(in: .whitespaces)
+        guard recursiveSearch, !rawQuery.isEmpty else { return }
+        let query = FuzzyQuery(rawQuery)
+        activeQuery = query
 
         let generation: Int
         stateLock.lock()
@@ -1711,10 +1945,15 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         stateLock.unlock()
 
         let root = currentDirectory.resolvingSymlinksInPath()
+        let base = currentDirectory.standardizedFileURL.path
         let includeHidden = showHidden
 
         entries = []
         entryIsDirectory = []
+        matchScores.removeAll()
+        matchPositions.removeAll()
+        searchStartTime = Date()
+        isCrawling = true
         onSearchStarted?()
         onDirectoryChanged?()
         watchDirectory()
@@ -1730,6 +1969,8 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             let maxVisited = 500_000
             var visited = 0
             var matches: [(url: URL, isDir: Bool)] = []
+            var scores: [URL: Int] = [:]
+            var positions: [URL: [Int]] = [:]
 
             if let enumerator = fm.enumerator(
                 at: root,
@@ -1742,10 +1983,29 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                     if self.searchShouldStop(generation) { break }
                     visited += 1
                     if visited >= maxVisited || matches.count >= maxResults { break }
-                    guard matchesSearchPattern(item.lastPathComponent, pattern: pattern) else { continue }
+
+                    // Report on items *scanned*, not just items matched: a query
+                    // that matches rarely would otherwise leave the line stuck on
+                    // "Searching…" for the whole crawl.
+                    if visited - lastReported >= 250 {
+                        lastReported = visited
+                        let visitedSnapshot = visited
+                        let matchCount = matches.count
+                        DispatchQueue.main.async {
+                            guard self.generationIsCurrent(generation) else { return }
+                            self.onSearchProgress?(visitedSnapshot, matchCount)
+                        }
+                    }
+
+                    // Match against the same relative path the row will display,
+                    // so highlight offsets always line up.
+                    let name = FileTreeDataSource.relativeName(for: item, base: base)
+                    guard let match = query.match(name) else { continue }
                     var itemIsDir: ObjCBool = false
                     _ = fm.fileExists(atPath: item.path, isDirectory: &itemIsDir)
                     matches.append((item, itemIsDir.boolValue && !isPackage(item)))
+                    scores[item] = match.score
+                    if !match.positions.isEmpty { positions[item] = match.positions }
 
                     if visited - lastReported >= 250 {
                         lastReported = visited
@@ -1759,17 +2019,26 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 }
             }
 
-            matches.sort { a, b in
-                if a.isDir != b.isDir { return a.isDir }
-                return a.url.lastPathComponent.localizedCaseInsensitiveCompare(b.url.lastPathComponent) == .orderedAscending
-            }
-
             DispatchQueue.main.async {
-                guard self.generationIsCurrent(generation) else { return }
+                guard self.generationIsCurrent(generation) else {
+                    // Superseded: whichever search replaced this one owns `isCrawling`.
+                    return
+                }
+                self.isCrawling = false
+                self.lastScannedCount = visited
                 self.entries = matches.map { $0.url }
                 self.entryIsDirectory = matches.map { $0.isDir }
+                self.matchScores = scores
+                self.matchPositions = positions
                 self.resortCurrentEntries()
-                self.onSearchFinished?()
+                // The results are only visible once the table reloads, so do it here
+                // rather than waiting for the periodic metadata refresh to notice.
+                self.onDirectoryChanged?()
+                // Only a cancel can still show up here as "stopped": a superseded
+                // search has already been filtered out by the generation check.
+                let cancelled = self.searchShouldStop(generation)
+                let elapsed = Date().timeIntervalSince(self.searchStartTime)
+                self.onSearchFinished?(visited, matches.count, elapsed, cancelled)
             }
         }
     }
@@ -1796,16 +2065,53 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         return generation != searchGeneration || cancelledGeneration == generation
     }
 
+    /// The string shown for `url` in the list: path relative to the current
+    /// directory while recursively searching, otherwise the file name. The
+    /// recursive search matches against this same string, so the highlight
+    /// offsets it records always line up with the rendered row.
     func displayName(for url: URL) -> String {
-        let query = filterQuery.trimmingCharacters(in: .whitespaces)
-        guard recursiveSearch, !query.isEmpty else { return url.lastPathComponent }
+        guard recursiveSearch, !activeQuery.isEmpty else { return url.lastPathComponent }
+        return FileTreeDataSource.relativeName(for: url, base: currentDirectory.standardizedFileURL.path)
+    }
 
-        let base = currentDirectory.standardizedFileURL.path
-        let path = url.standardizedFileURL.path
-        if path.hasPrefix(base + "/") {
-            return String(path.dropFirst(base.count + 1))
+    static func relativeName(for url: URL, base: String) -> String {
+        // `base` already ends in "/" when the search is rooted at "/", so don't
+        // blindly append another one (that made every path look absolute-mismatched
+        // and fall back to the bare file name).
+        let prefix = base.hasSuffix("/") ? base : base + "/"
+        let path = url.path
+        if path.hasPrefix(prefix), path.count > prefix.count {
+            return String(path.dropFirst(prefix.count))
         }
         return url.lastPathComponent
+    }
+
+    /// Renders `name` with the characters the query matched emphasised, mapping
+    /// the matcher's character offsets onto UTF-16 ranges for the attributed string.
+    func highlightedName(_ name: String, positions: [Int], color: NSColor, font: NSFont?) -> NSAttributedString {
+        let baseFont = font ?? .systemFont(ofSize: NSFont.systemFontSize)
+        let highlighted = Set(positions)
+        // An attributed string brings its own paragraph style, and without one the
+        // cell wraps long (relative) search paths instead of truncating them — the
+        // second line then falls outside the row height and gets cut off.
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byTruncatingMiddle
+        let attributed = NSMutableAttributedString(string: name, attributes: [
+            .foregroundColor: color,
+            .font: baseFont,
+            .paragraphStyle: paragraph,
+        ])
+
+        var offset = 0
+        for (index, character) in name.enumerated() {
+            if highlighted.contains(index) {
+                let range = NSRange(location: offset, length: character.utf16.count)
+                attributed.addAttribute(.foregroundColor, value: NSColor.controlAccentColor, range: range)
+                attributed.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: baseFont.pointSize), range: range)
+            }
+            offset += character.utf16.count
+        }
+        return attributed
     }
 
     func attributes(for url: URL) -> [FileAttributeKey: Any] {
@@ -1884,6 +2190,16 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     private func sortedForDisplay(_ items: [(url: URL, isDir: Bool)]) -> [(url: URL, isDir: Bool)] {
         let ascending = sortAscending
+        if !activeQuery.isEmpty {
+            // Best match first while searching; the column sort breaks ties.
+            return items.sorted { a, b in
+                let sa = matchScores[a.url] ?? 0
+                let sb = matchScores[b.url] ?? 0
+                if sa != sb { return sa > sb }
+                let result = compare(a.url, b.url, isDir: a.isDir)
+                return ascending ? result == .orderedAscending : result == .orderedDescending
+            }
+        }
         return items.sorted { a, b in
             if a.isDir != b.isDir { return a.isDir }
             let result = compare(a.url, b.url, isDir: a.isDir)
@@ -1953,7 +2269,15 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 textField.isEditable = false
                 textField.isSelectable = false
                 textField.backgroundColor = .clear
+                // One line, truncated in the middle: recursively-searched rows show
+                // a relative path, which is far too long for the column. Wrapping
+                // would push the second line outside the fixed 24pt row height and
+                // clip it. The full path is available from the tooltip.
+                textField.usesSingleLineMode = true
+                textField.maximumNumberOfLines = 1
                 textField.lineBreakMode = .byTruncatingMiddle
+                textField.cell?.wraps = false
+                textField.allowsExpansionToolTips = true
                 textField.translatesAutoresizingMaskIntoConstraints = false
                 cell.addSubview(textField)
                 cell.textField = textField
@@ -1970,15 +2294,23 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 ])
             }
 
-            cell.textField?.stringValue = displayName(for: url)
-            cell.textField?.toolTip = url.path
+            let color: NSColor
             if isDir {
-                cell.textField?.textColor = .labelColor
+                color = .labelColor
             } else if url.pathExtension.isEmpty {
-                cell.textField?.textColor = .secondaryLabelColor
+                color = .secondaryLabelColor
             } else {
-                cell.textField?.textColor = .labelColor
+                color = .labelColor
             }
+            cell.textField?.textColor = color
+            let name = displayName(for: url)
+            if let positions = matchPositions[url], !positions.isEmpty,
+               let textField = cell.textField {
+                textField.attributedStringValue = highlightedName(name, positions: positions, color: color, font: textField.font)
+            } else {
+                cell.textField?.stringValue = name
+            }
+            cell.textField?.toolTip = url.path
             if let thumbnail = thumbnail(for: url, isDir: isDir) {
                 cell.imageView?.image = thumbnail
             } else {
