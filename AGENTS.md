@@ -77,6 +77,12 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   only for files whose `UTType` conforms to `.image`. `viewFor` returns the generic
   `NSWorkspace.icon` immediately and the async result triggers `onThumbnailReady`, which
   reloads just that row (`reloadData(forRowIndexes:columnIndexes:)`).
+- Bundles/packages (`.app`, `.bundle`, `.rtfd`, …) are presented as **files**, like Finder
+  does: the folder flag is computed as `isDirectory && !isPackage(url)` in `loadDirectory`
+  and the recursive search, so they sort with files, launch on double-click
+  (`navigateTo` sends non-directories to `NSWorkspace.open`) and can't be drop targets.
+  `isPackage` resolves symlinks first — `/Applications/Safari.app` is a link and the flag
+  isn't reported for the link itself. Want to browse a bundle's innards? Use Open in Finder.
 
 ## Conventions
 
@@ -92,7 +98,12 @@ and nesting (context-menu Indent/Unindent, classic outliner rule as described ab
 open / open with / trash / delete / rename / info, cut-copy-paste, create folder/file,
 hidden files toggle, drag & drop (move/copy within the app and to/from Finder; drop
 onto a folder row to move into it), "Open in Finder", column sorting (click Name/Size/Date
-header to sort and click again to reverse; folders always grouped first), Quick Look (context menu item
+header to sort and click again to reverse; folders always grouped first; the active column's
+header title gets a ▲/▼ suffix via `FileTreeDataSource.updateHeaderTitles`). The sort choice is
+global and remembered: `FileTreeDataSource.sortKey`/`sortAscending` persist to UserDefaults
+(`sortKey`/`sortAscending`) and are applied to every directory load, so the same sort sticks
+across navigation and launches, and `syncSortIndicator` keeps the header in sync.
+Quick Look (context menu item
 + Spacebar; `QLPreviewPanel` with the app delegate as dataSource), image thumbnails in
 the Name column, and filtering search
 (current folder, plus a "Recursive" checkbox that searches subfolders when a query is

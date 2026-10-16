@@ -43,6 +43,16 @@ struct FavoriteEntry {
     var depth: Int
 }
 
+/// Whether `url` is a bundle/package (an `.app`, `.bundle`, `.rtfd`, …). Finder
+/// presents packages as single files rather than folders, so we treat them as
+/// files for listing, sorting and opening.
+func isPackage(_ url: URL) -> Bool {
+    // Resolve first: some bundles (e.g. /Applications/Safari.app) are symlinks,
+    // and the flag isn't reported for the link itself.
+    let resolved = url.resolvingSymlinksInPath()
+    return (try? resolved.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
+}
+
 class FileTreeTableView: NSTableView {
     var onQuickLook: (() -> Void)?
 
@@ -297,7 +307,8 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         fileTreeDataSource = FileTreeDataSource()
         fileTreeTableView.dataSource = fileTreeDataSource
         fileTreeTableView.delegate = fileTreeDataSource
-        fileTreeTableView.sortDescriptors = [NSSortDescriptor(key: "name", ascending: true)]
+        fileTreeTableView.sortDescriptors = [fileTreeDataSource.currentSortDescriptor]
+        fileTreeDataSource.updateHeaderTitles(fileTreeTableView)
         fileTreeTableView.doubleAction = #selector(openDoubleClickedRow)
         fileTreeTableView.target = self
         fileTreeTableView.registerForDraggedTypes([.fileURL, .string])
@@ -489,7 +500,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     func navigateTo(url: URL, pushHistory: Bool = true) {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
-        guard isDir.boolValue else {
+        guard isDir.boolValue, !isPackage(url) else {
             NSWorkspace.shared.open(url)
             return
         }
@@ -509,6 +520,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
 
         fileTreeDataSource.loadDirectory(url)
+        syncSortIndicator()
         fileTreeTableView.reloadData()
         fileTreeTableView.deselectAll(nil)
         pathControl.url = url
@@ -580,7 +592,8 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     var targetDirectoryForNewItems: URL {
         if let sel = primarySelection {
             var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: sel.path, isDirectory: &isDir), isDir.boolValue {
+            if FileManager.default.fileExists(atPath: sel.path, isDirectory: &isDir),
+               isDir.boolValue, !isPackage(sel) {
                 return sel
             }
         }
@@ -769,7 +782,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     @objc func showAbout() {
         let alert = NSAlert()
         alert.messageText = "Founder"
-        alert.informativeText = "A macOS Finder clone built with Swift.\nVersion 0.3 (draft)"
+        alert.informativeText = "A macOS Finder clone built with Swift.\nVersion 0.4 (draft)"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
@@ -1169,7 +1182,8 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         // are revealed and selected in their containing folder.
         if urls.count == 1, let url = urls.first {
             var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue {
+            if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+               isDir.boolValue, !isPackage(url) {
                 NSWorkspace.shared.open(url)
                 return
             }
@@ -1225,7 +1239,17 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     func refreshCurrentDirectory() {
         let current = fileTreeDataSource.currentDirectory
         fileTreeDataSource.loadDirectory(current)
+        syncSortIndicator()
         fileTreeTableView.reloadData()
+    }
+
+    /// Keeps the header's sort arrow in sync with the app-wide sort choice, and
+    /// re-applies it if something cleared the table's descriptors.
+    func syncSortIndicator() {
+        let desired = [fileTreeDataSource.currentSortDescriptor]
+        if fileTreeTableView.sortDescriptors != desired {
+            fileTreeTableView.sortDescriptors = desired
+        }
     }
 
     func moveDroppedFiles(_ urls: [URL], into destinationDir: URL, isMove: Bool) {
@@ -1520,7 +1544,8 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         guard favorites.indices.contains(row) else { return nil }
         let url = URL(fileURLWithPath: (favorites[row].path as NSString).expandingTildeInPath)
         var isDir: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir), isDir.boolValue else {
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir),
+              isDir.boolValue, !isPackage(url) else {
             return nil
         }
         return url
@@ -1546,8 +1571,17 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var attributeCache: [URL: [FileAttributeKey: Any]] = [:]
     var filterQuery: String = ""
     var recursiveSearch = false
-    var sortKey: String = "name"
-    var sortAscending = true
+    var sortKey: String {
+        didSet { UserDefaults.standard.set(sortKey, forKey: "sortKey") }
+    }
+    var sortAscending: Bool {
+        didSet { UserDefaults.standard.set(sortAscending, forKey: "sortAscending") }
+    }
+
+    /// The single sort descriptor representing the current (app-wide) sort choice.
+    var currentSortDescriptor: NSSortDescriptor {
+        NSSortDescriptor(key: sortKey, ascending: sortAscending)
+    }
     var onDirectoryChanged: (() -> Void)?
     var onSearchStarted: (() -> Void)?
     var onSearchProgress: ((Int, Int) -> Void)?
@@ -1564,6 +1598,11 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     override init() {
         currentDirectory = FileManager.default.homeDirectoryForCurrentUser
+        // The sort choice is global (applies to every folder) and remembered
+        // across launches.
+        let defaults = UserDefaults.standard
+        sortKey = defaults.string(forKey: "sortKey") ?? "name"
+        sortAscending = (defaults.object(forKey: "sortAscending") as? Bool) ?? true
         super.init()
         loadDirectory(currentDirectory)
     }
@@ -1604,7 +1643,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 if !matchesSearchPattern(name, pattern: pattern) { continue }
                 var isDir: ObjCBool = false
                 _ = fileManager.fileExists(atPath: item.path, isDirectory: &isDir)
-                filtered.append((item, isDir.boolValue))
+                filtered.append((item, isDir.boolValue && !isPackage(item)))
             }
 
             filtered = sortedForDisplay(filtered)
@@ -1706,7 +1745,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                     guard matchesSearchPattern(item.lastPathComponent, pattern: pattern) else { continue }
                     var itemIsDir: ObjCBool = false
                     _ = fm.fileExists(atPath: item.path, isDirectory: &itemIsDir)
-                    matches.append((item, itemIsDir.boolValue))
+                    matches.append((item, itemIsDir.boolValue && !isPackage(item)))
 
                     if visited - lastReported >= 250 {
                         lastReported = visited
@@ -1863,8 +1902,25 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         guard let descriptor = tableView.sortDescriptors.first, let key = descriptor.key else { return }
         sortKey = key
         sortAscending = descriptor.ascending
+        updateHeaderTitles(tableView)
         resortCurrentEntries()
         onDirectoryChanged?()
+    }
+
+    /// Marks the sorted column's header with ▲ (ascending) or ▼ (descending) so
+    /// the active sort is obvious.
+    func updateHeaderTitles(_ tableView: NSTableView) {
+        for column in tableView.tableColumns {
+            let base: String
+            switch column.identifier.rawValue {
+            case "size": base = "Size"
+            case "date": base = "Date Modified"
+            default: base = "Name"
+            }
+            column.title = column.identifier.rawValue == sortKey
+                ? base + (sortAscending ? "  ▲" : "  ▼")
+                : base
+        }
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int {
