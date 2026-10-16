@@ -23,9 +23,7 @@ A macOS Finder clone written in Swift and AppKit.
   Folders are always grouped first.
 - Quick Look via the context menu or the Spacebar.
 - Hidden-file toggle.
-- Search with an optional recursive mode. The query is a case-insensitive regular
-  expression; recursive traversal runs asynchronously and is cancellable, with a spinner
-  and live scan/match counts.
+- Search with an optional recursive mode. The query is a case-insensitive fuzzy search; recursive traversal runs asynchronously and is cancellable, with live scan/match counts.
 
 ## Requirements
 
