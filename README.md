@@ -23,7 +23,10 @@ A macOS Finder clone written in Swift and AppKit.
   Folders are always grouped first.
 - Quick Look via the context menu or the Spacebar.
 - Hidden-file toggle.
-- Search with an optional recursive mode. The query is a case-insensitive fuzzy search; recursive traversal runs asynchronously and is cancellable, with live scan/match counts.
+- Search with an optional recursive mode. The query is fuzzy (fzf-style): whitespace-separated
+  terms that must all match, with `!` to exclude, `'` for an exact substring, and `^`/`$` to
+  anchor. Results are ranked best-first with the matched characters highlighted, and recursive
+  traversal runs asynchronously and is cancellable, with a spinner and live scan counts.
 
 ## Requirements
 
@@ -59,15 +62,25 @@ AGENTS.md                     notes and conventions for agents working on the pr
 
 ## Search syntax
 
-The search field accepts a case-insensitive regular expression. Because the pattern is
-unanchored, a plain word like `report` matches any name containing "report".
+The search field is fuzzy, in the spirit of fzf. Terms are separated by whitespace and
+**every** term must match, but the letters only have to appear in order — so `rfp` matches
+`ReserveForPlan.pdf`.
 
 | Want | Type |
 | --- | --- |
-| any characters | `.*` |
-| any single character | `.` |
-| names ending in `.txt` | `.*\.txt$` |
-| names starting with `img_` then digits | `^img_\d+` |
+| an exact substring | `'report` |
+| must start with | `^2025` |
+| must end with | `.pdf$` |
+| exclude matches | `!archive` |
+| all of several terms | `pr rfp` |
 
-An invalid pattern (for example `*.txt` or a lone `(`) shows an inline error instead of
-running the search.
+Results are ranked by match quality (word and camelCase boundaries and consecutive runs score
+higher, gaps are penalised) and the matched characters are highlighted in the Name column.
+Terms containing an uppercase letter are matched case-sensitively; everything else ignores
+case. There is no invalid input, so a malformed-looking query simply matches nothing. The `?`
+button next to the field shows this syntax in the app.
+
+Search runs on the button (or Return), not as you type, and the status line reports how many
+items were **scanned**, not only how many matched — e.g. `5,000 found of 5,401 scanned ·
+406 ms` — and stays up after the search finishes. Recursive traversal runs on a background
+queue and can be cancelled.
