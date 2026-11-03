@@ -62,6 +62,33 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   `accepts/begin/endPreviewPanelControl` methods DO need `override` even though the
   app delegate is a plain `NSObject`. Spacebar is caught by the `FileTreeTableView`
   subclass overriding `keyDown`.
+- **Edit menu actions must use the standard selectors** `cut(_:)`, `copy(_:)`,
+  `paste(_:)`, `selectAll(_:)` — not `copyItem`/`cutItem`-style custom names. Menu
+  key equivalents are dispatched by target resolution: a nil-target item is enabled
+  (and performed) as soon as *anything* in the key window's responder chain
+  implements the action, else it falls through to the app delegate. Nobody but the
+  delegate implements a custom selector, so ⌘C/⌘X/⌘V/⌘A always hit the delegate —
+  even when the first responder is a text field's field editor or the Quick Look
+  panel's text view, which is why selected text in a preview (or in the search
+  field) could never be copied. With the standard selectors the focused text view
+  answers first and the delegate's file-level implementation is just the fallback.
+  Note `NSResponder` declares `selectAll:`, so ⌘A resolves to `NSTableView`'s own
+  `selectAll:` and never reaches the delegate.
+- Copy writes real `public.file-url` items with
+  `NSPasteboard.general.writeObjects(urls as [NSURL])`, like Finder, so files can be
+  pasted into other apps; the private `clipboard` array only adds cut-vs-copy intent
+  (the pasteboard can't express "move"). `clipboardChangeCount` tracks
+  `NSPasteboard.changeCount` so ⌘V ignores that array (and pastes whatever file URLs
+  another app copied) once something else has replaced the pasteboard.
+- ⌘C inside a key Quick Look panel is handled by a `keyDown` local monitor
+  (`installQuickLookCopyMonitor`) rather than left to the responder chain: the panel
+  is its own window, and in some states the key equivalent resolved to the app
+  delegate's `copy(_:)` (files) while the preview's text view still held the
+  selection — so ⌘A-selected text never reached the pasteboard, even though
+  mouse-selected text worked. The monitor copies the panel's `NSTextView` selection
+  (Quick Look text previews use `QLTextView`, an `NSTextView` subclass) and lets the
+  event through untouched when there is no selection, which keeps Finder's behaviour
+  of copying the selected files.
 - Column sorting: set `sortDescriptorPrototype` on each `NSTableColumn` and implement
   `tableView(_:sortDescriptorsDidChange:)` on the data source; re-sort in place so it
   also works on async recursive-search results.

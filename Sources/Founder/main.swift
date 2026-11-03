@@ -256,6 +256,13 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     var searchStatusHeightConstraint: NSLayoutConstraint!
 
     var clipboard: [(url: URL, isCut: Bool)] = []
+    /// `NSPasteboard.general.changeCount` right after we wrote our own file URLs.
+    /// Used to tell "the pasteboard still holds what Founder copied" (so the cut
+    /// flag in `clipboard` applies) from "something else replaced it since".
+    var clipboardChangeCount = -1
+    /// Local key monitor that lets ⌘C copy the Quick Look selection (see
+    /// `installQuickLookCopyMonitor`).
+    var quickLookCopyMonitor: Any?
     var navigationHistory: [URL] = []
     var historyIndex: Int = -1
 
@@ -265,6 +272,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         setupMainWindow()
+        installQuickLookCopyMonitor()
 
         fileTreeDataSource.onDirectoryChanged = { [weak self] in
             guard let self = self else { return }
@@ -766,6 +774,38 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
     }
 
+    // MARK: Quick Look — text copy
+
+    /// Quick Look's preview is a separate window with its own first responder, so
+    /// ⌘C resolves against whatever the panel's responder chain offers: usually its
+    /// text view (`QLTextView`, an `NSTextView`), but in some states the key
+    /// equivalent lands on Founder's Copy menu item instead and the *files* get
+    /// copied while the selected text is ignored. Watching the panel's key events
+    /// makes the intent explicit: with a selection in the preview, ⌘C copies the
+    /// text and the event never reaches the menu.
+    func installQuickLookCopyMonitor() {
+        quickLookCopyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard event.charactersIgnoringModifiers?.lowercased() == "c",
+                  event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                  let panel = QLPreviewPanel.shared(),
+                  panel.isVisible, panel.isKeyWindow else { return event }
+
+            guard let textView = Self.selectedTextView(in: panel.contentView) else { return event }
+            textView.copy(nil)
+            return nil
+        }
+    }
+
+    /// Text view inside the preview panel that currently holds a selection.
+    static func selectedTextView(in view: NSView?) -> NSTextView? {
+        guard let view = view else { return nil }
+        if let text = view as? NSTextView, text.selectedRange().length > 0 { return text }
+        for subview in view.subviews {
+            if let found = selectedTextView(in: subview) { return found }
+        }
+        return nil
+    }
+
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
         true
     }
@@ -846,11 +886,11 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
         // Edit menu
         let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(withTitle: "Cut", action: #selector(cutItem), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "Copy", action: #selector(copyItem), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Paste", action: #selector(pasteItem), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Cut", action: #selector(cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "v")
         editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "Select All", action: #selector(selectAll), keyEquivalent: "a")
+        editMenu.addItem(withTitle: "Select All", action: #selector(selectAll(_:)), keyEquivalent: "a")
         let editMenuTopItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
         editMenuTopItem.submenu = editMenu
         menubar.addItem(editMenuTopItem)
@@ -910,9 +950,9 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         menu.addItem(withTitle: "Get Info", action: #selector(getInfo), keyEquivalent: "")
         menu.addItem(withTitle: "Rename", action: #selector(renameItem), keyEquivalent: "")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Cut", action: #selector(cutItem), keyEquivalent: "")
-        menu.addItem(withTitle: "Copy", action: #selector(copyItem), keyEquivalent: "")
-        menu.addItem(withTitle: "Paste", action: #selector(pasteItem), keyEquivalent: "")
+        menu.addItem(withTitle: "Cut", action: #selector(cut(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Copy", action: #selector(copy(_:)), keyEquivalent: "")
+        menu.addItem(withTitle: "Paste", action: #selector(paste(_:)), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Create Folder", action: #selector(createFolder), keyEquivalent: "")
         menu.addItem(withTitle: "Create File", action: #selector(createFile), keyEquivalent: "")
@@ -966,16 +1006,16 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
 
         let hasSelection = !selectedFileURLs.isEmpty
-        let pasteboardHasFiles = !clipboard.isEmpty
+        let pasteboardHasFiles = !pasteEntries.isEmpty
 
         for item in menu.items {
             switch item.action {
             case #selector(openItem), #selector(openWith), #selector(getInfo),
-                 #selector(renameItem), #selector(cutItem), #selector(copyItem),
+                 #selector(renameItem), #selector(cut(_:)), #selector(copy(_:)),
                  #selector(moveToTrash), #selector(deletePermanently),
                  #selector(addToFavorites), #selector(toggleQuickLook(_:)):
                 item.isEnabled = hasSelection
-            case #selector(pasteItem):
+            case #selector(paste(_:)):
                 item.isEnabled = pasteboardHasFiles
             default:
                 item.isEnabled = true
@@ -1193,23 +1233,53 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
     }
 
-    @objc func cutItem() {
+    @objc func cut(_ sender: Any?) {
         let urls = selectedFileURLs
         guard !urls.isEmpty else { return }
         clipboard = urls.map { ($0, true) }
+        writeFilesToPasteboard(urls)
     }
 
-    @objc func copyItem() {
+    @objc func copy(_ sender: Any?) {
         let urls = selectedFileURLs
         guard !urls.isEmpty else { return }
         clipboard = urls.map { ($0, false) }
+        writeFilesToPasteboard(urls)
     }
 
-    @objc func pasteItem() {
-        guard !clipboard.isEmpty else { return }
+    /// File URLs currently on the system pasteboard (empty when it holds
+    /// anything that isn't a file, e.g. text).
+    var pasteboardFileURLs: [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        let objects = NSPasteboard.general.readObjects(forClasses: [NSURL.self], options: options)
+        return (objects as? [URL]) ?? []
+    }
+
+    /// Finder-style copy: the files themselves go on the system pasteboard so
+    /// other apps (Finder, Mail, Terminal) can paste them. `clipboard` only adds
+    /// the cut/copy intent that the pasteboard can't express.
+    func writeFilesToPasteboard(_ urls: [URL]) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects(urls as [NSURL])
+        clipboardChangeCount = pasteboard.changeCount
+    }
+
+    /// What ⌘V should operate on: our own clipboard while it still matches the
+    /// pasteboard, otherwise whatever files some other app copied.
+    var pasteEntries: [(url: URL, isCut: Bool)] {
+        if NSPasteboard.general.changeCount == clipboardChangeCount {
+            return clipboard
+        }
+        return pasteboardFileURLs.map { ($0, false) }
+    }
+
+    @objc func paste(_ sender: Any?) {
+        let entries = pasteEntries
+        guard !entries.isEmpty else { return }
         let destinationDir = targetDirectoryForNewItems
 
-        for entry in clipboard {
+        for entry in entries {
             let destination = uniqueDestination(in: destinationDir, name: entry.url.lastPathComponent)
             do {
                 if entry.isCut {
@@ -1222,7 +1292,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
             }
         }
 
-        if clipboard.allSatisfy({ $0.isCut }) {
+        if entries.allSatisfy({ $0.isCut }) {
             clipboard = []
         }
         refreshCurrentDirectory()
@@ -1232,8 +1302,8 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         uniqueDestinationURL(in: directory, name: name)
     }
 
-    @objc func selectAll() {
-        fileTreeTableView.selectAll(nil)
+    @objc func selectAll(_ sender: Any?) {
+        fileTreeTableView.selectAll(sender)
     }
 
     // MARK: Actions — Create
