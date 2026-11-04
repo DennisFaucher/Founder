@@ -366,12 +366,10 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
 
         // Periodic metadata refresh so external file edits (size/date) show up
-        // even when the directory itself didn't change on disk. `entries` stays
-        // put, so the row-index selection survives the reload as it is.
+        // even when the directory itself didn't change on disk.
         let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self = self, self.window?.isKeyWindow == true else { return }
-            self.fileTreeDataSource.attributeCache.removeAll()
-            self.fileTreeTableView.reloadData()
+            self.refreshMetadata()
         }
         RunLoop.main.add(timer, forMode: .common)
 
@@ -1628,6 +1626,16 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         syncSortIndicator()
         fileTreeTableView.reloadData()
         selectFileURLs(fileTreeDataSource.selectionBeforeReload)
+    }
+
+    /// Drops cached file attributes and redraws, keeping the selection on the
+    /// same files. `reloadData()` itself clears the selection, so without the
+    /// restore every click was undone a second or two later by this refresh.
+    func refreshMetadata() {
+        let selected = selectedFileURLs
+        fileTreeDataSource.attributeCache.removeAll()
+        fileTreeTableView.reloadData()
+        selectFileURLs(selected)
     }
 
     /// Selects the rows for `urls`, clearing the selection when none of them are

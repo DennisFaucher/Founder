@@ -110,6 +110,12 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   only for files whose `UTType` conforms to `.image`. `viewFor` returns the generic
   `NSWorkspace.icon` immediately and the async result triggers `onThumbnailReady`, which
   reloads just that row (`reloadData(forRowIndexes:columnIndexes:)`).
+- `NSTableView.reloadData()` **clears the selection** — row indexes are not carried over
+  across a full reload — so any refresh that must keep the selection has to capture the
+  selected URLs first and re-select them afterwards (`refreshMetadata`,
+  `refreshCurrentDirectory`, the `onDirectoryChanged` handler). Missing it in the 2 s
+  metadata timer made a just-clicked file deselect a second or two later;
+  `MetadataRefreshTests` covers that case.
 - `setupMainWindow` sizes the default window *before* `setFrameAutosaveName`: setting the
   name restores the saved frame, and the `setContentSize` that used to sit below the panes
   ran afterwards, so every launch opened at 900×620 and saved that over the user's size.

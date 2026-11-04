@@ -437,3 +437,34 @@ final class PathBarTests: XCTestCase {
         XCTAssertEqual(split.subviews[0].frame.width, 420, accuracy: 1)
     }
 }
+
+final class MetadataRefreshTests: XCTestCase {
+    /// `refreshMetadata` reloads the table, and `NSTableView.reloadData()` drops
+    /// the selection — so the two-second refresh used to deselect whatever had
+    /// just been clicked.
+    func testMetadataRefreshKeepsTheSelection() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FounderRefresh-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            try Data("x".utf8).write(to: root.appendingPathComponent(name))
+        }
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let delegate = FounderAppDelegate()
+        delegate.setupMainWindow()
+        delegate.window.setFrameAutosaveName("")
+        let table = try XCTUnwrap(delegate.fileTreeTableView)
+        delegate.fileTreeDataSource.loadDirectory(root)
+        table.reloadData()
+
+        let expected = delegate.fileTreeDataSource.entries[1]
+        table.selectRowIndexes(IndexSet(integer: 1), byExtendingSelection: false)
+        XCTAssertEqual(table.selectedRowIndexes, IndexSet(integer: 1))
+
+        delegate.refreshMetadata()
+
+        XCTAssertEqual(table.selectedRowIndexes, IndexSet(integer: 1))
+        XCTAssertEqual(delegate.selectedFileURLs, [expected])
+    }
+}
