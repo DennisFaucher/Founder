@@ -395,6 +395,11 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         )
         window.title = "Founder"
         window.center()
+        // Size the default window *before* the autosave name is set: setting it
+        // restores the saved frame, and the `setContentSize` below the panes used
+        // to run afterwards, throwing that restore away and then saving the
+        // default size back over the user's.
+        window.setContentSize(NSSize(width: 900, height: 620))
         window.setFrameAutosaveName("FounderWindow")
 
         splitView = GrabbySplitView(frame: NSRect(x: 0, y: 0, width: 900, height: 620))
@@ -407,7 +412,6 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         splitView.addSubview(rightPane)
 
         window.contentView = splitView
-        window.setContentSize(NSSize(width: 900, height: 620))
         splitView.setPosition(220, ofDividerAt: 0)
     }
 

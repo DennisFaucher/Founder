@@ -110,6 +110,11 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   only for files whose `UTType` conforms to `.image`. `viewFor` returns the generic
   `NSWorkspace.icon` immediately and the async result triggers `onThumbnailReady`, which
   reloads just that row (`reloadData(forRowIndexes:columnIndexes:)`).
+- `setupMainWindow` sizes the default window *before* `setFrameAutosaveName`: setting the
+  name restores the saved frame, and the `setContentSize` that used to sit below the panes
+  ran afterwards, so every launch opened at 900×620 and saved that over the user's size.
+  The window tests call `setFrameAutosaveName("")` right after building the window so they
+  don't rewrite the app's saved frame.
 - The sidebar could not be widened past a point when the path footer was deep: an
   `NSPathControl`'s intrinsic width is the whole path and it has default compression
   resistance, so it set a hard minimum width on the file pane (~975 pt for a path under
