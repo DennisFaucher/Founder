@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import CoreServices
 import Quartz
 import QuickLookThumbnailing
 import UniformTypeIdentifiers
@@ -300,6 +301,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     var fileTreeDataSource: FileTreeDataSource!
 
     var showHiddenItem: NSMenuItem!
+    var finderFavoritesSyncItem: NSMenuItem!
     var goBackItem: NSMenuItem!
     var goForwardItem: NSMenuItem!
     var pathControl: NSPathControl!
@@ -324,6 +326,12 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     var navigationHistory: [URL] = []
     var historyIndex: Int = -1
 
+    /// UserDefaults keys for the Finder sidebar mirror.
+    static let finderSyncKey = "syncFavoritesToFinder"
+    static let finderManagedKey = "finderManagedFavoritePaths"
+    /// Guards against a sync triggered by its own writes.
+    var isSyncingFinderFavorites = false
+
     let favoritesPaneTag = 1
     let fileTreePaneTag = 2
 
@@ -331,6 +339,19 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         setupMenuBar()
         setupMainWindow()
         installQuickLookCopyMonitor()
+
+        // Restore the Finder sidebar mirror on launch — an entry the user removed
+        // there while Founder was closed would otherwise stay missing. If the
+        // mirror was switched off but entries are still recorded as ours (the app
+        // quit or crashed before cleaning up), finish that cleanup first.
+        if isFinderFavoritesSyncEnabled {
+            let result = syncFavoritesToFinder()
+            if result.added > 0 || result.removed > 0 || result.failed > 0 {
+                NSLog("Founder: Finder favorites sync — added \(result.added), removed \(result.removed), failed \(result.failed)")
+            }
+        } else if !finderManagedPaths.isEmpty {
+            removeManagedFinderFavorites()
+        }
 
         fileTreeDataSource.onDirectoryChanged = { [weak self] in
             guard let self = self else { return }
@@ -441,6 +462,9 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
         favoritesDataSource.onFilesDropped = { [weak self] destination, urls, isMove in
             self?.moveDroppedFiles(urls, into: destination, isMove: isMove)
+        }
+        favoritesDataSource.onFavoritesChanged = { [weak self] in
+            self?.syncFavoritesToFinder()
         }
         favoritesListView.dataSource = favoritesDataSource
         favoritesListView.delegate = favoritesDataSource
@@ -1005,6 +1029,13 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         showHiddenItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Find", action: #selector(focusSearchField), keyEquivalent: "f")
+        viewMenu.addItem(.separator())
+        finderFavoritesSyncItem = viewMenu.addItem(
+            withTitle: "Sync Favorites to Finder",
+            action: #selector(toggleFinderFavoritesSync),
+            keyEquivalent: ""
+        )
+        finderFavoritesSyncItem.state = isFinderFavoritesSyncEnabled ? .on : .off
         let viewMenuTopItem = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
         viewMenuTopItem.submenu = viewMenu
         menubar.addItem(viewMenuTopItem)
@@ -1529,6 +1560,139 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         favoritesListView.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
     }
 
+    // MARK: Finder sidebar sync
+
+    struct FinderSyncResult {
+        var added = 0
+        var removed = 0
+        var failed = 0
+        /// Finder's Favorites was empty, so there was nothing to insert behind.
+        var noAnchor = false
+    }
+
+    var isFinderFavoritesSyncEnabled: Bool {
+        UserDefaults.standard.bool(forKey: Self.finderSyncKey)
+    }
+
+    /// Unit tests build the real app delegate, and a test that edits favorites
+    /// must not start editing the developer's Finder sidebar.
+    static var isRunningTests: Bool {
+        NSClassFromString("XCTestCase") != nil
+    }
+
+    /// Paths Founder itself put into Finder's Favorites. Only these may ever be
+    /// removed again — anything the user added by hand in Finder is off limits.
+    var finderManagedPaths: [String] {
+        get { UserDefaults.standard.stringArray(forKey: Self.finderManagedKey) ?? [] }
+        set { UserDefaults.standard.set(newValue, forKey: Self.finderManagedKey) }
+    }
+
+    @objc func toggleFinderFavoritesSync() {
+        let defaults = UserDefaults.standard
+        let enable = !defaults.bool(forKey: Self.finderSyncKey)
+        defaults.set(enable, forKey: Self.finderSyncKey)
+        finderFavoritesSyncItem.state = enable ? .on : .off
+
+        if enable {
+            let result = syncFavoritesToFinder()
+            NSLog("Founder: Finder favorites sync on — added \(result.added), removed \(result.removed)")
+            if result.noAnchor {
+                let alert = NSAlert()
+                alert.messageText = "Finder's Favorites List Is Empty"
+                alert.informativeText = "Founder appends to the list, which needs one existing entry to attach to. "
+                    + "Drag any folder into Finder's sidebar once, then turn the sync on again."
+                alert.runModal()
+            } else if result.failed > 0 {
+                let alert = NSAlert()
+                alert.messageText = "Some Favorites Could Not Be Added"
+                alert.informativeText = "Finder refused \(result.failed) of them. "
+                    + "The rest of the list is in sync and Founder will retry on the next change."
+                alert.runModal()
+            }
+        } else {
+            let removed = removeManagedFinderFavorites()
+            NSLog("Founder: Finder favorites sync off — removed \(removed) items")
+        }
+    }
+
+    /// Mirrors Founder's favorites into Finder's Favorites (the list open/save
+    /// panels show). One-way and opt-in: adds what is missing, removes only what
+    /// Founder added earlier and the user has since un-favourited. Nesting is
+    /// flattened — Finder's sidebar has no hierarchy — and new entries are
+    /// appended in Founder's order.
+    @discardableResult
+    func syncFavoritesToFinder() -> FinderSyncResult {
+        var result = FinderSyncResult()
+        guard !Self.isRunningTests,
+              isFinderFavoritesSyncEnabled,
+              !isSyncingFinderFavorites,
+              let favoritesDataSource = favoritesDataSource else {
+            return result
+        }
+        isSyncingFinderFavorites = true
+        defer { isSyncingFinderFavorites = false }
+
+        let fileManager = FileManager.default
+        let desired = favoritesDataSource.favorites.compactMap { favorite -> String? in
+            let path = FinderFavoritesList.normalizedPath(favorite.path)
+            var isDirectory: ObjCBool = false
+            guard fileManager.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return nil
+            }
+            return path
+        }
+
+        let current = FinderFavoritesList.paths()
+        let plan = FinderFavoritesPlan.make(desired: desired, current: current, managed: finderManagedPaths)
+        var failedKeys = Set<String>()
+
+        for path in plan.toRemove {
+            if FinderFavoritesList.remove(path: path) {
+                result.removed += 1
+            }
+        }
+
+        if !plan.toAdd.isEmpty && current.isEmpty {
+            result.noAnchor = true
+            for path in plan.toAdd {
+                failedKeys.insert(path.lowercased())
+            }
+        } else {
+            for path in plan.toAdd {
+                if FinderFavoritesList.add(path: path) {
+                    result.added += 1
+                } else {
+                    result.failed += 1
+                    failedKeys.insert(path.lowercased())
+                }
+            }
+        }
+
+        // Trust the insert results over a fresh read: `sharedfilelistd` can lag a
+        // few inserts behind, and a snapshot taken immediately after writing used
+        // to drop half the new entries from our ownership list.
+        finderManagedPaths = plan.managed.filter { !failedKeys.contains($0.lowercased()) }
+        return result
+    }
+
+    /// Removes the entries Founder added, leaving the user's own favorites in
+    /// place. Used when the sync is switched off.
+    @discardableResult
+    func removeManagedFinderFavorites() -> Int {
+        guard !Self.isRunningTests, !isSyncingFinderFavorites else { return 0 }
+        isSyncingFinderFavorites = true
+        defer { isSyncingFinderFavorites = false }
+
+        var removed = 0
+        for path in finderManagedPaths {
+            if FinderFavoritesList.remove(path: path) {
+                removed += 1
+            }
+        }
+        finderManagedPaths = []
+        return removed
+    }
+
     // MARK: Actions — View & Go
 
     @objc func toggleShowHidden() {
@@ -1703,12 +1867,146 @@ private final class OpenWithContext: NSObject {
     }
 }
 
+// MARK: - Finder Sidebar Favorites
+
+/// What a sync round has to do, separated from the (untestable) shared-file-list
+/// calls so the interesting rules can be unit tested.
+///
+/// Rules: add whatever Founder has that Finder lacks; remove only items Founder
+/// itself put there and that the user has since un-favourited; leave every
+/// hand-made Finder favorite alone, even if it points at the same folder.
+struct FinderFavoritesPlan: Equatable {
+    /// Paths to insert into Finder, in Founder's order.
+    var toAdd: [String]
+    /// Paths Founder added earlier that are no longer favorites.
+    var toRemove: [String]
+    /// The paths Founder owns after this round.
+    var managed: [String]
+
+    static func make(desired: [String], current: [String], managed: [String]) -> FinderFavoritesPlan {
+        func key(_ path: String) -> String { path.lowercased() }
+
+        var present = Set(current.map(key))
+        var toAdd: [String] = []
+        for path in desired where !present.contains(key(path)) {
+            toAdd.append(path)
+            present.insert(key(path))
+        }
+
+        let desiredKeys = Set(desired.map(key))
+        let currentKeys = Set(current.map(key))
+        let toRemove = managed.filter { !desiredKeys.contains(key($0)) && currentKeys.contains(key($0)) }
+        var managedAfter = managed.filter { desiredKeys.contains(key($0)) && currentKeys.contains(key($0)) }
+        var ownedKeys = Set(managedAfter.map(key))
+        for path in toAdd where !ownedKeys.contains(key(path)) {
+            managedAfter.append(path)
+            ownedKeys.insert(key(path))
+        }
+
+        return FinderFavoritesPlan(toAdd: toAdd, toRemove: toRemove, managed: managedAfter)
+    }
+}
+
+/// One-way mirror of Founder's favorites into Finder's own Favorites list — the
+/// one open/save panels show.
+///
+/// Finder keeps that list in a `LSSharedFileList`, and the API is the only
+/// supported way in: the `.sfl4` file under Application Support belongs to
+/// `sharedfilelistd`, so writing it directly gets clobbered. The API has been
+/// marked "no longer supported" since 10.11 but still works on macOS 26, so
+/// every call here is best-effort — if it ever stops working the sync simply
+/// does nothing.
+///
+/// Two macOS 26 quirks shape the code:
+/// * `kLSSharedFileListItemLast` / `…BeforeFirst` **segfault** when handed to
+///   `LSSharedFileListInsertItemURL`. New items must be anchored after a real
+///   item from a fresh snapshot, which also means a completely empty Finder
+///   sidebar can't be appended to (the sync reports that instead of crashing).
+/// * Items are matched by resolved URL, never by index: Finder reorders, and
+///   the user edits the same list from the sidebar.
+enum FinderFavoritesList {
+    struct Item {
+        let name: String
+        let path: String
+    }
+
+    /// Path form used for every comparison, so `/x/y/` and `/X/Y` line up.
+    ///
+    /// Symlinks are resolved too, and that one matters: Founder remembers the
+    /// OneDrive folders as `~/OneDrive - WWT/Customer`, but Finder resolves the
+    /// same folder to `~/Library/CloudStorage/OneDrive-WWT/Customer`, so without
+    /// `resolvingSymlinksInPath` every cloud favorite looks missing and gets
+    /// appended a second time (the daemon de-duplicates it by moving the existing
+    /// entry to the end).
+    static func normalizedPath(_ path: String) -> String {
+        let expanded = (path as NSString).expandingTildeInPath
+        return URL(fileURLWithPath: expanded).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private static func list() -> LSSharedFileList? {
+        guard let created = LSSharedFileListCreate(nil, kLSSharedFileListFavoriteItems.takeUnretainedValue(), nil) else {
+            return nil
+        }
+        return created.takeRetainedValue()
+    }
+
+    private static func rawItems(_ list: LSSharedFileList) -> [LSSharedFileListItem] {
+        guard let snapshot = LSSharedFileListCopySnapshot(list, nil) else { return [] }
+        return (snapshot.takeRetainedValue() as? [LSSharedFileListItem]) ?? []
+    }
+
+    /// Resolved file URL of one entry, or nil for non-file sidebar items
+    /// (AirDrop, tags, …).
+    private static func url(of item: LSSharedFileListItem) -> URL? {
+        var error: Unmanaged<CFError>?
+        guard let resolved = LSSharedFileListItemCopyResolvedURL(item, 0, &error) else { return nil }
+        return resolved.takeRetainedValue() as URL
+    }
+
+    static func items() -> [Item] {
+        guard let list = list() else { return [] }
+        return rawItems(list).compactMap { item in
+            guard let url = url(of: item) else { return nil }
+            let name = LSSharedFileListItemCopyDisplayName(item).takeRetainedValue() as String
+            return Item(name: name, path: normalizedPath(url.path))
+        }
+    }
+
+    /// Normalized paths currently in Finder's Favorites, in sidebar order.
+    static func paths() -> [String] {
+        items().map { $0.path }
+    }
+
+    /// Appends one folder to the end of Finder's Favorites. Returns false when
+    /// the list has no real item to anchor behind (see the type comment).
+    @discardableResult
+    static func add(path: String) -> Bool {
+        guard let list = list(), let anchor = rawItems(list).last else { return false }
+        let url = URL(fileURLWithPath: normalizedPath(path)) as CFURL
+        return LSSharedFileListInsertItemURL(list, anchor, nil, nil, url, nil, nil) != nil
+    }
+
+    /// Removes the entry pointing at `path`, if there is one.
+    @discardableResult
+    static func remove(path: String) -> Bool {
+        guard let list = list() else { return false }
+        let target = normalizedPath(path).lowercased()
+        guard let item = rawItems(list).first(where: { url(of: $0)?.path.lowercased() == target }) else {
+            return false
+        }
+        return LSSharedFileListItemRemove(list, item) == noErr
+    }
+}
+
 // MARK: - Favorites Data Source
 
 class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var favorites: [FavoriteEntry] = []
     var onSelect: ((String) -> Void)?
     var onFilesDropped: ((URL, [URL], Bool) -> Void)?
+    /// Fired after any change to the list (add, remove, reorder, indent, drop),
+    /// so the delegate can mirror it elsewhere.
+    var onFavoritesChanged: (() -> Void)?
     private var suppressSelectionCallback = false
 
     /// Horizontal offset applied per nesting level, in points.
@@ -1748,6 +2046,7 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     func saveFavorites() {
         let stored = favorites.map { ["path": $0.path, "depth": $0.depth] as [String: Any] }
         UserDefaults.standard.set(stored, forKey: "favorites")
+        onFavoritesChanged?()
     }
 
     func add(path: String) {

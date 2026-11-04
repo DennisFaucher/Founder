@@ -137,6 +137,33 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   `true` from `acceptsFirstMouse(for:)`, since the press that activates an inactive
   window otherwise only activates Founder. Without the wider band, a slightly-off grab
   landed on the favorites table and started a row drag.
+- The Finder Favorites mirror ("Sync Favorites to Finder" in the View menu) is a
+  one-way copy of Founder's favorites into Finder's own Favorites list — the one
+  open/save panels show. It has to use `LSSharedFileList` (`CoreServices`), because
+  the `.sfl4` file in Application Support belongs to `sharedfilelistd` and writing it
+  directly gets clobbered. That API has been marked "no longer supported" since
+  10.11 but still works on macOS 26, so every call is best-effort (a failure just
+  means the sync skips that round). Three macOS 26 traps, all hit during testing:
+  * `kLSSharedFileListItemLast` / `…BeforeFirst` **segfault** when passed to
+    `LSSharedFileListInsertItemURL`. Anchor new items after a *real* item from a
+    fresh snapshot; chaining ("insert after the one I just added") keeps Founder's
+    order. A completely empty Finder sidebar therefore can't be appended to — the
+    sync reports that instead of crashing.
+  * Paths must be compared with `resolvingSymlinksInPath()`: Founder stores
+    `~/OneDrive - WWT/Customer` while Finder resolves
+    `~/Library/CloudStorage/OneDrive-WWT/Customer`, so without it every cloud
+    favorite looks missing and is re-inserted (the daemon de-duplicates by
+    **moving** the existing entry to the end, which silently reshuffles the sidebar).
+  * Don't re-read the list immediately after inserting to decide what you own —
+    `sharedfilelistd` lags behind the inserts and half the new entries vanish from
+    that snapshot. Record ownership from the insert results instead.
+- Sync ownership: `finderManagedFavoritePaths` (UserDefaults) lists the entries
+  Founder itself added. Only those are ever removed — switching the sync off (or
+  launching with it off, which finishes a cleanup the app never got to) deletes the
+  owned entries and leaves hand-made Finder favorites untouched. `FinderFavoritesPlan`
+  holds the add/remove rules and is unit tested; `FinderFavoritesList` is the thin,
+  untested IO layer. The sync never runs under XCTest (`isRunningTests`) so a test
+  run can't rewrite the developer's sidebar.
 - Bundles/packages (`.app`, `.bundle`, `.rtfd`, …) are presented as **files**, like Finder
   does: the folder flag is computed as `isDirectory && !isPackage(url)` in `loadDirectory`
   and the recursive search, so they sort with files, launch on double-click
@@ -209,5 +236,11 @@ the syntax. Note the search matches `displayName(for:)` (the relative path while
 recursively searching) so highlight offsets line up with the rendered row.
 Multi-file drag & drop: drag any selection onto a folder row in the list or onto a
 folder in the Favorites sidebar (moves within the app, copies from Finder), and
-drag out to Finder. Possible next steps: column/icon view modes, better Get Info
+drag out to Finder.
+Finder Favorites mirror: View ▸ Sync Favorites to Finder (a checkable item, off by
+default) copies Founder's list into Finder's own Favorites so open/save panels show the
+same folders. One-way, add/remove only for entries Founder created, nesting flattened
+(Finder's sidebar is flat), new entries appended in Founder's order, re-synced after
+every favorites change and at launch. Turning it off removes the entries it added.
+Possible next steps: column/icon view modes, better Get Info
 window, status bar.

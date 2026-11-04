@@ -468,3 +468,134 @@ final class MetadataRefreshTests: XCTestCase {
         XCTAssertEqual(delegate.selectedFileURLs, [expected])
     }
 }
+
+final class FinderFavoritesPlanTests: XCTestCase {
+    func testAddsWhatFinderIsMissingInFoundersOrder() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/B", "/Users/x/A", "/Users/x/C"],
+            current: ["/Users/x/A"],
+            managed: []
+        )
+        XCTAssertEqual(plan.toAdd, ["/Users/x/B", "/Users/x/C"])
+        XCTAssertEqual(plan.toRemove, [])
+        XCTAssertEqual(plan.managed, ["/Users/x/B", "/Users/x/C"])
+    }
+
+    /// Anything the user dragged into Finder's sidebar themselves is invisible to
+    /// Founder: it is neither duplicated nor ever removed again.
+    func testHandAddedFinderItemsAreLeftAlone() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/A"],
+            current: ["/Users/x/A", "/Users/x/HandMade"],
+            managed: []
+        )
+        XCTAssertEqual(plan.toAdd, [])
+        XCTAssertEqual(plan.toRemove, [])
+        XCTAssertEqual(plan.managed, [])
+    }
+
+    func testRemovesOnlyFounderOwnedItemsThatWereUnfavourited() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/A"],
+            current: ["/Users/x/A", "/Users/x/Gone", "/Users/x/HandMade"],
+            managed: ["/Users/x/A", "/Users/x/Gone"]
+        )
+        XCTAssertEqual(plan.toRemove, ["/Users/x/Gone"])
+        XCTAssertEqual(plan.managed, ["/Users/x/A"])
+    }
+
+    func testAnAlreadySyncedListIsANoOp() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/A", "/Users/x/B"],
+            current: ["/Users/x/A", "/Users/x/B"],
+            managed: ["/Users/x/A", "/Users/x/B"]
+        )
+        XCTAssertEqual(plan.toAdd, [])
+        XCTAssertEqual(plan.toRemove, [])
+        XCTAssertEqual(plan.managed, ["/Users/x/A", "/Users/x/B"])
+    }
+
+    /// Deleting one of our entries in Finder is honoured: it is forgotten, so it
+    /// gets re-added once and then counted as ours again — not re-added forever.
+    func testOwnershipIsDroppedWhenTheUserDeletesOurEntryInFinder() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/A"],
+            current: [],
+            managed: ["/Users/x/A"]
+        )
+        XCTAssertEqual(plan.toAdd, ["/Users/x/A"])
+        XCTAssertEqual(plan.managed, ["/Users/x/A"])
+    }
+
+    func testDuplicateFavoritesAreAddedOnce() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/A", "/Users/x/A"],
+            current: [],
+            managed: []
+        )
+        XCTAssertEqual(plan.toAdd, ["/Users/x/A"])
+        XCTAssertEqual(plan.managed, ["/Users/x/A"])
+    }
+
+    /// The same folder reached through a different spelling — OneDrive paths vary
+    /// in case between Finder's bookmark resolution and Founder's stored path —
+    /// must not become a second sidebar entry.
+    func testComparisonIsCaseInsensitive() {
+        let plan = FinderFavoritesPlan.make(
+            desired: ["/Users/x/OneDrive-WWT/Customer"],
+            current: ["/users/x/onedrive-wwt/customer"],
+            managed: []
+        )
+        XCTAssertEqual(plan.toAdd, [])
+        XCTAssertEqual(plan.toRemove, [])
+    }
+}
+
+final class FinderFavoritePathTests: XCTestCase {
+    func testTrailingSlashIsIgnored() {
+        XCTAssertEqual(
+            FinderFavoritesList.normalizedPath("/Users/x/A/"),
+            FinderFavoritesList.normalizedPath("/Users/x/A")
+        )
+    }
+
+    func testRedundantComponentsAreRemoved() {
+        XCTAssertEqual(FinderFavoritesList.normalizedPath("/Users/x/./A"), "/Users/x/A")
+        XCTAssertEqual(FinderFavoritesList.normalizedPath("/Users/x/B/../A"), "/Users/x/A")
+    }
+
+    func testTildeIsExpanded() {
+        XCTAssertFalse(FinderFavoritesList.normalizedPath("~/Desktop").hasPrefix("~"))
+    }
+}
+
+final class FavoritesChangeNotificationTests: XCTestCase {
+    /// Every mutation funnels through `saveFavorites`, which is what drives the
+    /// Finder mirror — losing that callback would silently stop the sync.
+    func testEveryFavoritesChangeNotifiesTheMirror() {
+        let defaults = UserDefaults.standard
+        let backup = defaults.object(forKey: "favorites")
+        defer {
+            if let backup = backup {
+                defaults.set(backup, forKey: "favorites")
+            } else {
+                defaults.removeObject(forKey: "favorites")
+            }
+        }
+
+        let dataSource = FavoritesDataSource()
+        var changes = 0
+        dataSource.onFavoritesChanged = { changes += 1 }
+
+        let scratch = "/tmp/founder-sync-\(UUID().uuidString)"
+        dataSource.add(path: scratch)
+        XCTAssertEqual(changes, 1)
+
+        dataSource.indent(at: dataSource.favorites.count - 1)
+        XCTAssertGreaterThanOrEqual(changes, 1)
+
+        dataSource.remove(at: dataSource.favorites.count - 1)
+        XCTAssertEqual(dataSource.favorites.contains { $0.path == scratch }, false)
+        XCTAssertGreaterThanOrEqual(changes, 2)
+    }
+}
