@@ -317,6 +317,9 @@ final class SplitViewTests: XCTestCase {
         let delegate = FounderAppDelegate()
         delegate.setupMainWindow()
         let window = try XCTUnwrap(delegate.window)
+        // Building the real window must not overwrite the size the app saved in
+        // `NSWindow Frame FounderWindow`.
+        window.setFrameAutosaveName("")
         window.setContentSize(NSSize(width: 900, height: 620))
         let split = try XCTUnwrap(delegate.splitView as? GrabbySplitView)
         split.layoutSubtreeIfNeeded()
@@ -349,5 +352,88 @@ final class SplitViewTests: XCTestCase {
     func testDividerAcceptsTheClickThatActivatesTheWindow() throws {
         let split = try makeSplitView()
         XCTAssertTrue(split.acceptsFirstMouse(for: nil))
+    }
+}
+
+final class PathBarTests: XCTestCase {
+    private let deepPath = URL(fileURLWithPath:
+        "/Users/faucherd/Documents/Sync/MBP-Personal/1273 Washington Street Gloucester/AirBnB/Business Card/Claude/v1.1")
+
+    /// The app window, at a size where the sidebar has room to grow.
+    private func makeApp() throws -> FounderAppDelegate {
+        let delegate = FounderAppDelegate()
+        delegate.setupMainWindow()
+        let window = try XCTUnwrap(delegate.window)
+        // See SplitViewTests: keep the app's autosaved window size intact.
+        window.setFrameAutosaveName("")
+        window.setContentSize(NSSize(width: 900, height: 620))
+        return delegate
+    }
+
+    func testDeepPathIsShortenedToItsLastFolders() throws {
+        let delegate = try makeApp()
+        delegate.updatePathBar(to: deepPath)
+        XCTAssertEqual(delegate.pathControl.url?.path, "/…/Claude/v1.1")
+        XCTAssertEqual(delegate.pathControl.toolTip, deepPath.path)
+    }
+
+    func testShortPathIsShownWhole() throws {
+        let delegate = try makeApp()
+        let home = URL(fileURLWithPath: "/Users/faucherd")
+        delegate.updatePathBar(to: home)
+        XCTAssertEqual(delegate.pathControl.url?.path, "/Users/faucherd")
+    }
+
+    func testShownComponentMapsBackToTheRealFolder() throws {
+        let delegate = try makeApp()
+        delegate.updatePathBar(to: deepPath)
+        let clicked = URL(fileURLWithPath: "/…/Claude")
+        XCTAssertEqual(
+            delegate.realURL(forPathBarURL: clicked).path,
+            "/Users/faucherd/Documents/Sync/MBP-Personal/1273 Washington Street Gloucester/AirBnB/Business Card/Claude"
+        )
+    }
+
+    func testEllipsisMapsToTheFolderHoldingTheFirstShownComponent() throws {
+        let delegate = try makeApp()
+        delegate.updatePathBar(to: deepPath)
+        let clicked = URL(fileURLWithPath: "/…")
+        XCTAssertEqual(
+            delegate.realURL(forPathBarURL: clicked).path,
+            "/Users/faucherd/Documents/Sync/MBP-Personal/1273 Washington Street Gloucester/AirBnB/Business Card"
+        )
+    }
+
+    /// The bug: a deep path made the file pane demand ~975 pt, so the sidebar
+    /// divider could not be dragged right at all.
+    func testDeepPathDoesNotPinTheSidebar() throws {
+        let delegate = try makeApp()
+        let window = try XCTUnwrap(delegate.window)
+        let split = try XCTUnwrap(delegate.splitView)
+
+        delegate.updatePathBar(to: deepPath)
+        split.layoutSubtreeIfNeeded()
+        XCTAssertEqual(window.frame.width, 900, accuracy: 1, "a deep path must not stretch the window")
+
+        split.setPosition(420, ofDividerAt: 0)
+        split.layoutSubtreeIfNeeded()
+        XCTAssertEqual(
+            split.subviews[0].frame.width, 420, accuracy: 1,
+            "the sidebar must be able to grow past the old 279 pt limit"
+        )
+    }
+
+    /// Even a single huge component (which shortening cannot help with) must not
+    /// put a floor under the file pane's width.
+    func testVeryLongFolderNameDoesNotPinTheSidebar() throws {
+        let delegate = try makeApp()
+        let split = try XCTUnwrap(delegate.splitView)
+        let longName = String(repeating: "very-long-folder-name-", count: 8)
+        delegate.updatePathBar(to: URL(fileURLWithPath: "/tmp/" + longName))
+        split.layoutSubtreeIfNeeded()
+
+        split.setPosition(420, ofDividerAt: 0)
+        split.layoutSubtreeIfNeeded()
+        XCTAssertEqual(split.subviews[0].frame.width, 420, accuracy: 1)
     }
 }

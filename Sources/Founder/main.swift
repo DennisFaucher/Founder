@@ -366,22 +366,12 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
 
         // Periodic metadata refresh so external file edits (size/date) show up
-        // even when the directory itself didn't change on disk.
+        // even when the directory itself didn't change on disk. `entries` stays
+        // put, so the row-index selection survives the reload as it is.
         let timer = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             guard let self = self, self.window?.isKeyWindow == true else { return }
-            // Preserve selection across periodic metadata refresh
-            let selectedURLs = self.selectedFileURLs
             self.fileTreeDataSource.attributeCache.removeAll()
             self.fileTreeTableView.reloadData()
-            var newIndexes: IndexSet = []
-            for url in selectedURLs {
-                if let idx = self.fileTreeDataSource.entries.firstIndex(where: { $0 == url }) {
-                    newIndexes.insert(idx)
-                }
-            }
-            if !newIndexes.isEmpty {
-                self.fileTreeTableView.selectRowIndexes(newIndexes, byExtendingSelection: false)
-            }
         }
         RunLoop.main.add(timer, forMode: .common)
 
@@ -529,6 +519,13 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         pathControl.backgroundColor = .clear
         pathControl.target = self
         pathControl.action = #selector(pathControlClicked(_:))
+        // A path control's intrinsic width is the whole path, and the default
+        // compression resistance makes that a hard minimum: a deep path pushed
+        // the file pane's minimum width past 900 pt, which pinned the sidebar
+        // narrow and made its divider refuse to move. The bar shortens deep
+        // paths itself (`updatePathBar`); this lets it squeeze further if even
+        // the shortened path is too wide.
+        pathControl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         searchField = NSSearchField()
         searchField.translatesAutoresizingMaskIntoConstraints = false
@@ -633,9 +630,63 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         return view
     }
 
+    /// Stands in for the folders the path bar leaves out. It is a real path
+    /// component in the *display* URL only; clicks are mapped back below.
+    static let pathBarEllipsis = "…"
+    /// How many trailing folders the bar keeps, shell-prompt style. The full
+    /// path is always in the tooltip.
+    static let pathBarShownComponentCount = 2
+    /// Real components (below "/") of the directory the bar is showing.
+    private var pathBarComponents: [String] = []
+    /// How many trailing components of `pathBarComponents` the bar draws.
+    private var pathBarShownCount = 0
+
+    /// Shows `url` in the footer, shortened to its last few folders.
+    ///
+    /// `NSPathControl` lays out every component at its natural width, so a deep
+    /// path used to demand most of the window: the file pane could not get
+    /// narrower than ~975 pt, which left the favorites sidebar stuck at whatever
+    /// width the window allowed and made its divider look stuck.
+    func updatePathBar(to url: URL) {
+        pathBarComponents = url.standardizedFileURL.pathComponents.filter { $0 != "/" }
+        let shown = min(Self.pathBarShownComponentCount, pathBarComponents.count)
+        pathBarShownCount = shown
+
+        if pathBarComponents.count > shown {
+            let tail = pathBarComponents.suffix(shown)
+            pathControl.url = URL(fileURLWithPath: "/" + ([Self.pathBarEllipsis] + tail).joined(separator: "/"))
+            // "/…" is not a real path, so AppKit gives that component a document
+            // icon; it stands for folders, so draw a folder.
+            for cell in pathControl.pathItems where cell.url?.lastPathComponent == Self.pathBarEllipsis {
+                cell.image = NSImage(named: NSImage.folderName)
+            }
+        } else {
+            pathControl.url = url
+        }
+        pathControl.toolTip = url.path
+    }
+
+    /// Maps a component of the (possibly shortened) path bar back to the folder
+    /// it stands for: `/…/Claude` becomes `/Users/…/Business Card/Claude`, and
+    /// the ellipsis itself becomes the folder holding the first shown component.
+    func realURL(forPathBarURL clicked: URL) -> URL {
+        let shown = clicked.pathComponents.filter { $0 != "/" }
+        let hidden = max(0, pathBarComponents.count - pathBarShownCount)
+        guard hidden > 0, shown.first == Self.pathBarEllipsis else { return clicked }
+
+        let tail = Array(shown.dropFirst())
+        // The components after the ellipsis are the first ones of the shown
+        // tail; anything else means AppKit handed us a different cell.
+        guard Array(pathBarComponents.dropFirst(hidden).prefix(tail.count)) == tail else { return clicked }
+
+        let depth = hidden + tail.count
+        let path = "/" + pathBarComponents.prefix(depth).joined(separator: "/")
+        return URL(fileURLWithPath: path.isEmpty ? "/" : path)
+    }
+
     @objc func pathControlClicked(_ sender: NSPathControl) {
         guard let item = sender.clickedPathItem, let url = item.url else { return }
-        navigateTo(url: url)
+        navigateTo(url: realURL(forPathBarURL: url))
     }
 
     @objc func performSearch() {
@@ -788,7 +839,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         syncSortIndicator()
         fileTreeTableView.reloadData()
         fileTreeTableView.deselectAll(nil)
-        pathControl.url = url
+        updatePathBar(to: url)
         window.title = "Founder — " + (url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent)
         updateGoBackItem()
     }

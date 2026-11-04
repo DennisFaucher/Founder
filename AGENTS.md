@@ -110,14 +110,22 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   only for files whose `UTType` conforms to `.image`. `viewFor` returns the generic
   `NSWorkspace.icon` immediately and the async result triggers `onThumbnailReady`, which
   reloads just that row (`reloadData(forRowIndexes:columnIndexes:)`).
-- The favorites/file sidebar is a plain `NSSplitView` (`GrabbySplitView`) rather than
-  AppKit's default: AppKit hit-tests only the 1 pt divider (plus ~2 pt of slop), so a
-  grab a few points off the line landed on the favorites table, which answered with a
-  row drag instead of a resize. The subclass widens the grab band to ±4 pt, draws the
-  resize cursor over the whole band, and returns `true` from `acceptsFirstMouse(for:)`
-  so the click that activates an inactive window also starts the drag — without that,
-  the first attempt on a background window only activated Founder, which is what made
-  sidebar resizing appear to work "sometimes".
+- The sidebar could not be widened past a point when the path footer was deep: an
+  `NSPathControl`'s intrinsic width is the whole path and it has default compression
+  resistance, so it set a hard minimum width on the file pane (~975 pt for a path under
+  `1273 Washington Street Gloucester/AirBnB/Business Card/Claude/v1.1`). Dragging the
+  divider was not broken at all — the pane simply could not get narrower, and the window
+  grew instead. The footer now shows only the last two folders behind an ellipsis
+  (`updatePathBar`), keeps the full path in the tooltip, maps clicks back to the real
+  folders (`realURL(forPathBarURL:)`, the ellipsis goes to the folder holding the first
+  shown one), and its compression resistance is dropped to `.defaultLow` so no path can
+  set a floor. `PathBarTests.testVeryLongFolderNameDoesNotPinTheSidebar` is the
+  regression test: without the resistance change the sidebar collapses to 0 pt.
+- The divider is also easier to grab than AppKit's default: `GrabbySplitView` widens the
+  hit band from the 1 pt line to ±4 pt, draws the resize cursor across it, and returns
+  `true` from `acceptsFirstMouse(for:)`, since the press that activates an inactive
+  window otherwise only activates Founder. Without the wider band, a slightly-off grab
+  landed on the favorites table and started a row drag.
 - Bundles/packages (`.app`, `.bundle`, `.rtfd`, …) are presented as **files**, like Finder
   does: the folder flag is computed as `isDirectory && !isPackage(url)` in `loadDirectory`
   and the recursive search, so they sort with files, launch on double-click
