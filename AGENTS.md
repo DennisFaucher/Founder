@@ -55,9 +55,15 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   enable/disable items; `tableView.clickedRow` identifies the right-clicked row.
 - `NSTableView.setDraggingSourceOperationMask(_:forLocation:)` is now
   `...(_:forLocal:)` in the macOS 26/27 SDK.
-- Drag & drop: implement `writeRowsWith` (source) plus
-  `validateDrop`/`acceptDrop` (destination) on `FileTreeDataSource`; register the
-  table with `registerForDraggedTypes([.fileURL])`.
+- Drag & drop: the source is `tableView(_:pasteboardWriterForRow:)` returning one
+  `NSURL` per dragged row — NSTableView calls it for every row in the selection and
+  merges them into a single drag session, which is what makes multi-file drags
+  work (it supersedes `tableView(_:writeRowsWith:to:)`, which AppKit stops calling
+  as soon as this method exists). Both
+  destinations (`FileTreeDataSource` for folder rows, `FavoritesDataSource` for
+  sidebar favorites) loop over every URL from `droppedFileURLs(from:)`, so drops
+  move/copy the whole selection; register the tables with
+  `registerForDraggedTypes([.fileURL])`.
 - Quick Look: `QLPreviewPanel` + `previewItemAt` returning `url as NSURL`; the
   `accepts/begin/endPreviewPanelControl` methods DO need `override` even though the
   app delegate is a plain `NSObject`. Spacebar is caught by the `FileTreeTableView`
@@ -104,6 +110,14 @@ The app MUST run as a `.app` bundle (use `build_app.sh`) — a bare executable w
   only for files whose `UTType` conforms to `.image`. `viewFor` returns the generic
   `NSWorkspace.icon` immediately and the async result triggers `onThumbnailReady`, which
   reloads just that row (`reloadData(forRowIndexes:columnIndexes:)`).
+- The favorites/file sidebar is a plain `NSSplitView` (`GrabbySplitView`) rather than
+  AppKit's default: AppKit hit-tests only the 1 pt divider (plus ~2 pt of slop), so a
+  grab a few points off the line landed on the favorites table, which answered with a
+  row drag instead of a resize. The subclass widens the grab band to ±4 pt, draws the
+  resize cursor over the whole band, and returns `true` from `acceptsFirstMouse(for:)`
+  so the click that activates an inactive window also starts the drag — without that,
+  the first attempt on a background window only activated Founder, which is what made
+  sidebar resizing appear to work "sometimes".
 - Bundles/packages (`.app`, `.bundle`, `.rtfd`, …) are presented as **files**, like Finder
   does: the folder flag is computed as `isDirectory && !isPackage(url)` in `loadDirectory`
   and the recursive search, so they sort with files, launch on double-click
@@ -174,5 +188,7 @@ characters are highlighted in the Name column via `matchPositions` +
 `highlightedName`; the "?" button next to the search field (`showSearchSyntax`) explains
 the syntax. Note the search matches `displayName(for:)` (the relative path while
 recursively searching) so highlight offsets line up with the rendered row.
-Possible next steps: drop files onto a sidebar favorite to move them there, column/icon
-view modes, better Get Info window, status bar.
+Multi-file drag & drop: drag any selection onto a folder row in the list or onto a
+folder in the Favorites sidebar (moves within the app, copies from Finder), and
+drag out to Finder. Possible next steps: column/icon view modes, better Get Info
+window, status bar.

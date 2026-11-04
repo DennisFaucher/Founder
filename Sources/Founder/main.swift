@@ -10,7 +10,12 @@ import Quartz
 import QuickLookThumbnailing
 import UniformTypeIdentifiers
 
-let favoriteRowPasteboardType = NSPasteboard.PasteboardType("com.dennisfaucher.founder.favoriteRow")
+/// Kept on a type rather than as a top-level `let`: top-level constants are
+/// initialised by the executable's top-level code, so tests that `@testable
+/// import` the module would see them as nil.
+enum PasteboardTypes {
+    static let favoriteRow = NSPasteboard.PasteboardType("com.dennisfaucher.founder.favoriteRow")
+}
 
 // MARK: - Fuzzy search (fzf-style)
 
@@ -221,6 +226,59 @@ func uniqueDestinationURL(in directory: URL, name: String) -> URL {
     return destination
 }
 
+// MARK: - Split view
+
+/// `NSSplitView` whose divider is actually easy to grab.
+///
+/// AppKit hit-tests a 1 pt divider with only a couple of points of slop, so a
+/// press a few points off the edge goes to the table underneath — and the
+/// favorites list starts a row drag instead of resizing the pane, which reads as
+/// "the divider won't move". The grab band here is `grabMargin` points on each
+/// side and shows the resize cursor over the whole band.
+///
+/// It also accepts the click that activates the window: without that, the first
+/// drag on an inactive Founder window only activates the app and the divider
+/// never moves, so resizing worked "sometimes".
+final class GrabbySplitView: NSSplitView {
+    static let grabMargin: CGFloat = 4
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// Divider rectangles in this view's coordinates. Founder only ever uses a
+    /// vertical split (the favorites sidebar next to the file list).
+    private var dividerRects: [NSRect] {
+        guard isVertical else { return [] }
+        var rects: [NSRect] = []
+        var x: CGFloat = 0
+        for pane in subviews.dropLast() {
+            x += pane.frame.width
+            rects.append(NSRect(x: x, y: 0, width: dividerThickness, height: bounds.height))
+            x += dividerThickness
+        }
+        return rects
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        if isVertical, let superview = superview {
+            let local = convert(point, from: superview)
+            if bounds.contains(local),
+               dividerRects.contains(where: {
+                   $0.insetBy(dx: -Self.grabMargin, dy: 0).contains(local)
+               }) {
+                return self
+            }
+        }
+        return super.hitTest(point)
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        for rect in dividerRects {
+            addCursorRect(rect.insetBy(dx: -Self.grabMargin, dy: 0), cursor: .resizeLeftRight)
+        }
+    }
+}
+
 // MARK: - Entry point
 
 let app = NSApplication.shared
@@ -276,18 +334,10 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
         fileTreeDataSource.onDirectoryChanged = { [weak self] in
             guard let self = self else { return }
-            // Preserve selection by URL across reloads
-            let selectedURLs = self.selectedFileURLs
             self.fileTreeTableView.reloadData()
-            var newIndexes: IndexSet = []
-            for url in selectedURLs {
-                if let idx = self.fileTreeDataSource.entries.firstIndex(where: { $0 == url }) {
-                    newIndexes.insert(idx)
-                }
-            }
-            if !newIndexes.isEmpty {
-                self.fileTreeTableView.selectRowIndexes(newIndexes, byExtendingSelection: false)
-            }
+            // Keep the selection on the same *files*: entries are re-sorted,
+            // filtered and reloaded, so the old row numbers point at other rows.
+            self.selectFileURLs(self.fileTreeDataSource.selectionBeforeReload)
         }
 
         fileTreeDataSource.onSearchStarted = { [weak self] in
@@ -357,7 +407,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         window.center()
         window.setFrameAutosaveName("FounderWindow")
 
-        splitView = NSSplitView(frame: NSRect(x: 0, y: 0, width: 900, height: 620))
+        splitView = GrabbySplitView(frame: NSRect(x: 0, y: 0, width: 900, height: 620))
         splitView.dividerStyle = .thin
         splitView.isVertical = true
 
@@ -402,7 +452,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
         favoritesListView.dataSource = favoritesDataSource
         favoritesListView.delegate = favoritesDataSource
-        favoritesListView.registerForDraggedTypes([favoriteRowPasteboardType, .fileURL])
+        favoritesListView.registerForDraggedTypes([PasteboardTypes.favoriteRow, .fileURL])
         favoritesListView.setDraggingSourceOperationMask([], forLocal: false)
         favoritesListView.setDraggingSourceOperationMask(.move, forLocal: true)
 
@@ -456,6 +506,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         fileTreeTableView.addTableColumn(dateColumn)
 
         fileTreeDataSource = FileTreeDataSource()
+        fileTreeDataSource.owningTableView = fileTreeTableView
         fileTreeTableView.dataSource = fileTreeDataSource
         fileTreeTableView.delegate = fileTreeDataSource
         fileTreeTableView.sortDescriptors = [fileTreeDataSource.currentSortDescriptor]
@@ -1124,6 +1175,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
             }
         }
         refreshCurrentDirectory()
+        selectFileURLs(urls)
     }
 
     @objc func deletePermanently() {
@@ -1148,6 +1200,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
             }
         }
         refreshCurrentDirectory()
+        selectFileURLs(urls)
     }
 
     @objc func getInfo() {
@@ -1275,6 +1328,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     }
 
     @objc func paste(_ sender: Any?) {
+        let previousSelection = selectedFileURLs
         let entries = pasteEntries
         guard !entries.isEmpty else { return }
         let destinationDir = targetDirectoryForNewItems
@@ -1296,6 +1350,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
             clipboard = []
         }
         refreshCurrentDirectory()
+        selectFileURLs(previousSelection)
     }
 
     func uniqueDestination(in directory: URL, name: String) -> URL {
@@ -1517,6 +1572,15 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         fileTreeDataSource.loadDirectory(current)
         syncSortIndicator()
         fileTreeTableView.reloadData()
+        selectFileURLs(fileTreeDataSource.selectionBeforeReload)
+    }
+
+    /// Selects the rows for `urls`, clearing the selection when none of them are
+    /// in the listing any more (after a move, a delete or a filter change). Row
+    /// indexes can't be reused for this: they shift whenever files come or go.
+    func selectFileURLs(_ urls: [URL]) {
+        let rows = urls.compactMap { fileTreeDataSource.entries.firstIndex(of: $0) }
+        fileTreeTableView.selectRowIndexes(IndexSet(rows), byExtendingSelection: false)
     }
 
     /// Keeps the header's sort arrow in sync with the app-wide sort choice, and
@@ -1529,6 +1593,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     }
 
     func moveDroppedFiles(_ urls: [URL], into destinationDir: URL, isMove: Bool) {
+        let previousSelection = selectedFileURLs
         let fm = FileManager.default
         var changed = false
         for source in urls {
@@ -1549,6 +1614,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         }
         if changed {
             refreshCurrentDirectory()
+            selectFileURLs(previousSelection)
         }
     }
 
@@ -1755,7 +1821,7 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard favorites.indices.contains(row) else { return nil }
         let item = NSPasteboardItem()
-        item.setString(String(row), forType: favoriteRowPasteboardType)
+        item.setString(String(row), forType: PasteboardTypes.favoriteRow)
         return item
     }
 
@@ -1766,7 +1832,7 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         proposedDropOperation dropOperation: NSTableView.DropOperation
     ) -> NSDragOperation {
         if info.draggingSource as? NSTableView === tableView,
-           info.draggingPasteboard.string(forType: favoriteRowPasteboardType) != nil {
+           info.draggingPasteboard.string(forType: PasteboardTypes.favoriteRow) != nil {
             tableView.setDropRow(row, dropOperation: .above)
             return .move
         }
@@ -1792,7 +1858,7 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         dropOperation: NSTableView.DropOperation
     ) -> Bool {
         if info.draggingSource as? NSTableView === tableView,
-           let rowString = info.draggingPasteboard.string(forType: favoriteRowPasteboardType),
+           let rowString = info.draggingPasteboard.string(forType: PasteboardTypes.favoriteRow),
            let source = Int(rowString),
            favorites.indices.contains(source) {
             var destination = row > source ? row - 1 : row
@@ -1865,6 +1931,13 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         NSSortDescriptor(key: sortKey, ascending: sortAscending)
     }
     var onDirectoryChanged: (() -> Void)?
+    /// The table this data source fills. Row *indexes* go stale whenever files
+    /// move, get deleted or the list is re-sorted, so reloads restore the
+    /// selection from `selectionBeforeReload` instead.
+    weak var owningTableView: NSTableView?
+    /// URLs selected just before `entries` was last rebuilt; consumed by the
+    /// reload handler in `FounderAppDelegate`.
+    private(set) var selectionBeforeReload: [URL] = []
     var onSearchStarted: (() -> Void)?
     var onSearchProgress: ((Int, Int) -> Void)?
     /// Called with `scanned`, `found`, elapsed seconds and whether the crawl was
@@ -1902,7 +1975,17 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         directorySource?.cancel()
     }
 
+    /// Remembers the current selection before `entries` is replaced. Callers that
+    /// mutate the file system first (drag & drop, trash, cut-paste) call this
+    /// before touching the files, so the URLs still match what the user saw.
+    func retainSelection() {
+        selectionBeforeReload = owningTableView?.selectedRowIndexes.compactMap {
+            entries.indices.contains($0) ? entries[$0] : nil
+        } ?? []
+    }
+
     func loadDirectory(_ url: URL) {
+        retainSelection()
         currentDirectory = url
         attributeCache.removeAll()
 
@@ -1978,6 +2061,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             guard FileManager.default.fileExists(atPath: self.currentDirectory.path) else {
                 self.directorySource?.cancel()
                 self.directorySource = nil
+                self.retainSelection()
                 self.entries = []
                 self.entryIsDirectory = []
                 self.onDirectoryChanged?()
@@ -2018,6 +2102,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         let base = currentDirectory.standardizedFileURL.path
         let includeHidden = showHidden
 
+        retainSelection()
         entries = []
         entryIsDirectory = []
         matchScores.removeAll()
@@ -2096,11 +2181,12 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 }
                 self.isCrawling = false
                 self.lastScannedCount = visited
+                self.retainSelection()
                 self.entries = matches.map { $0.url }
                 self.entryIsDirectory = matches.map { $0.isDir }
                 self.matchScores = scores
                 self.matchPositions = positions
-                self.resortCurrentEntries()
+                self.resortCurrentEntries(retainingSelection: false)
                 // The results are only visible once the table reloads, so do it here
                 // rather than waiting for the periodic metadata refresh to notice.
                 self.onDirectoryChanged?()
@@ -2277,7 +2363,8 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         }
     }
 
-    private func resortCurrentEntries() {
+    private func resortCurrentEntries(retainingSelection: Bool = true) {
+        if retainingSelection { retainSelection() }
         let items = zip(entries, entryIsDirectory).map { (url: $0.0, isDir: $0.1) }
         let sorted = sortedForDisplay(items)
         entries = sorted.map { $0.url }
@@ -2475,12 +2562,13 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     // MARK: Drag & drop — source
 
-    func tableView(_ tableView: NSTableView, writeRowsWith rowIndexes: IndexSet, to pboard: NSPasteboard) -> Bool {
-        let urls = rowIndexes.compactMap { entries.indices.contains($0) ? entries[$0] : nil }
-        guard !urls.isEmpty else { return false }
-        pboard.clearContents()
-        pboard.writeObjects(urls as [NSURL])
-        return true
+    /// One pasteboard writer per dragged row. NSTableView asks for every row in
+    /// the selection and merges the results into a single drag session, which is
+    /// what a multi-file drag needs (this is the documented replacement for
+    /// `writeRowsWith:to:`; when both are implemented AppKit uses this one).
+    func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
+        guard entries.indices.contains(row) else { return nil }
+        return entries[row] as NSURL
     }
 
     // MARK: Drag & drop — destination
@@ -2525,6 +2613,10 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     ) -> Bool {
         guard let sourceURLs = droppedFileURLs(from: info) else { return false }
 
+        // Row numbers will point at other files once the moved items are gone.
+        let previousSelection = tableView.selectedRowIndexes.compactMap {
+            entries.indices.contains($0) ? entries[$0] : nil
+        }
         let dropOnFolder = dropOperation == .on && row < entries.count && entryIsDirectory[row]
         let targetDir = dropOnFolder ? entries[row] : currentDirectory
         let isMove = info.draggingSourceOperationMask.contains(.move)
@@ -2551,6 +2643,8 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         if anySucceeded {
             loadDirectory(currentDirectory)
             onDirectoryChanged?()
+            let remaining = previousSelection.compactMap { entries.firstIndex(of: $0) }
+            tableView.selectRowIndexes(IndexSet(remaining), byExtendingSelection: false)
         }
         return anySucceeded
     }

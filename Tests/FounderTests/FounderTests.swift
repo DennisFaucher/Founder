@@ -137,3 +137,217 @@ final class RelativeNameTests: XCTestCase {
         )
     }
 }
+
+/// Minimal `NSDraggingInfo` so the drop handlers can be exercised without a
+/// real drag session (multi-file drags are hard to drive from a test).
+final class FakeDraggingInfo: NSObject, NSDraggingInfo {
+    var draggingDestinationWindow: NSWindow?
+    var draggingSourceOperationMask: NSDragOperation
+    var draggingLocation: NSPoint = .zero
+    var draggingPasteboard: NSPasteboard
+    var draggingSource: Any?
+    var draggingSequenceNumber: Int = 1
+    var animatesToDestination = false
+    var numberOfValidItemsForDrop = 0
+    var springLoadingHighlight: NSSpringLoadingHighlight = .none
+    var draggingFormation: NSDraggingFormation = .none
+    var draggedImageLocation: NSPoint { .zero }
+    var draggedImage: NSImage? { nil }
+
+    init(urls: [URL], operation: NSDragOperation) {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("FounderTests-\(UUID().uuidString)"))
+        pasteboard.clearContents()
+        pasteboard.writeObjects(urls as [NSURL])
+        draggingPasteboard = pasteboard
+        draggingSourceOperationMask = operation
+        super.init()
+    }
+
+    func enumerateDraggingItems(
+        options enumOpts: NSDraggingItemEnumerationOptions,
+        for view: NSView?,
+        classes classArray: [AnyClass],
+        searchOptions: [NSPasteboard.ReadingOptionKey: Any],
+        using block: (NSDraggingItem, Int, UnsafeMutablePointer<ObjCBool>) -> Void
+    ) {}
+
+    func resetSpringLoading() {}
+
+    func slideDraggedImage(to screenPoint: NSPoint) {}
+
+    override func namesOfPromisedFilesDropped(atDestination dropDestination: URL) -> [String]? { nil }
+}
+
+final class DragAndDropTests: XCTestCase {
+    private var root: URL!
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("FounderTests-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("Target"), withIntermediateDirectories: true)
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            try Data("x".utf8).write(to: root.appendingPathComponent(name))
+        }
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func targetRow(in dataSource: FileTreeDataSource) -> Int {
+        dataSource.entries.firstIndex { $0.lastPathComponent == "Target" }!
+    }
+
+    private func fileURLs() -> [URL] {
+        ["a.txt", "b.txt", "c.txt"].map { root.appendingPathComponent($0) }
+    }
+
+    func testDroppingSeveralFilesOntoAFolderMovesAllOfThem() {
+        let dataSource = FileTreeDataSource()
+        dataSource.loadDirectory(root)
+        let row = targetRow(in: dataSource)
+        let table = NSTableView()
+        let info = FakeDraggingInfo(urls: fileURLs(), operation: .move)
+
+        XCTAssertEqual(
+            dataSource.tableView(table, validateDrop: info, proposedRow: row, proposedDropOperation: .on),
+            .move
+        )
+        XCTAssertTrue(dataSource.tableView(table, acceptDrop: info, row: row, dropOperation: .on))
+
+        let target = root.appendingPathComponent("Target")
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            XCTAssertTrue(
+                FileManager.default.fileExists(atPath: target.appendingPathComponent(name).path),
+                "\(name) should have been moved into Target"
+            )
+            XCTAssertFalse(
+                FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path),
+                "\(name) should no longer be in the source folder"
+            )
+        }
+    }
+
+    /// After moving files out of the listing, the selection must not slide down
+    /// to whatever rows now occupy those numbers (Finder leaves nothing selected).
+    func testMovingFilesClearsTheSelectionInsteadOfSlidingIt() {
+        let dataSource = FileTreeDataSource()
+        let table = NSTableView()
+        table.addTableColumn(NSTableColumn(identifier: .init("name")))
+        table.dataSource = dataSource
+        dataSource.owningTableView = table
+        dataSource.loadDirectory(root)
+        table.reloadData()
+
+        let rows = IndexSet(["a.txt", "b.txt", "c.txt"].compactMap { name in
+            dataSource.entries.firstIndex { $0.lastPathComponent == name }
+        })
+        table.selectRowIndexes(rows, byExtendingSelection: false)
+        XCTAssertEqual(table.selectedRowIndexes.count, 3)
+
+        let row = targetRow(in: dataSource)
+        let info = FakeDraggingInfo(urls: fileURLs(), operation: .move)
+        XCTAssertTrue(dataSource.tableView(table, acceptDrop: info, row: row, dropOperation: .on))
+
+        XCTAssertTrue(
+            table.selectedRowIndexes.isEmpty,
+            "the moved rows should not leave the rows below them selected"
+        )
+    }
+
+    func testCopyingSeveralFilesKeepsTheOriginals() {
+        let dataSource = FileTreeDataSource()
+        dataSource.loadDirectory(root)
+        let row = targetRow(in: dataSource)
+        let table = NSTableView()
+        let info = FakeDraggingInfo(urls: fileURLs(), operation: .copy)
+
+        XCTAssertEqual(
+            dataSource.tableView(table, validateDrop: info, proposedRow: row, proposedDropOperation: .on),
+            .copy
+        )
+        XCTAssertTrue(dataSource.tableView(table, acceptDrop: info, row: row, dropOperation: .on))
+
+        let target = root.appendingPathComponent("Target")
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: target.appendingPathComponent(name).path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent(name).path))
+        }
+    }
+
+    func testDroppingSeveralFilesOntoAFavoriteFolderHandsThemAllOver() {
+        let favorites = FavoritesDataSource()
+        let target = root.appendingPathComponent("Target")
+        favorites.favorites = [FavoriteEntry(path: target.path, depth: 0)]
+
+        var dropped: (URL, [URL], Bool)?
+        favorites.onFilesDropped = { dropped = ($0, $1, $2) }
+        let table = NSTableView()
+        let info = FakeDraggingInfo(urls: fileURLs(), operation: .move)
+
+        XCTAssertEqual(
+            favorites.tableView(table, validateDrop: info, proposedRow: 0, proposedDropOperation: .on),
+            .move
+        )
+        XCTAssertTrue(favorites.tableView(table, acceptDrop: info, row: 0, dropOperation: .on))
+        XCTAssertEqual(dropped?.0, target)
+        XCTAssertEqual(dropped?.1.count, 3)
+        XCTAssertEqual(dropped?.2, true)
+    }
+
+    func testDroppingAFolderIntoItselfIsRejected() {
+        let dataSource = FileTreeDataSource()
+        dataSource.loadDirectory(root)
+        let row = targetRow(in: dataSource)
+        let table = NSTableView()
+        let target = root.appendingPathComponent("Target")
+        let info = FakeDraggingInfo(urls: [target], operation: .move)
+
+        XCTAssertEqual(
+            dataSource.tableView(table, validateDrop: info, proposedRow: row, proposedDropOperation: .on),
+            []
+        )
+    }
+}
+
+final class SplitViewTests: XCTestCase {
+    /// Builds the real window so the divider lands where it does in the app.
+    private func makeSplitView() throws -> GrabbySplitView {
+        let delegate = FounderAppDelegate()
+        delegate.setupMainWindow()
+        let window = try XCTUnwrap(delegate.window)
+        window.setContentSize(NSSize(width: 900, height: 620))
+        let split = try XCTUnwrap(delegate.splitView as? GrabbySplitView)
+        split.layoutSubtreeIfNeeded()
+        return split
+    }
+
+    /// AppKit only hit-tests the 1 pt divider (so grabs a few points off went to
+    /// the favorites table, which starts a row drag instead of resizing).
+    func testDividerIsGrabbableBeyondTheDividerLine() throws {
+        let split = try makeSplitView()
+        let divider = split.subviews[0].frame.maxX
+        let superview = try XCTUnwrap(split.superview)
+
+        for offset in [-3.0, -1.0, 1.0, 3.0] {
+            let point = split.convert(NSPoint(x: divider + offset, y: 100), to: superview)
+            XCTAssertTrue(
+                split.hitTest(point) === split,
+                "\(offset) points from the divider should still grab it"
+            )
+        }
+
+        // Well inside the pane the table keeps its clicks, so selecting and
+        // dragging favorites still works.
+        let away = split.convert(NSPoint(x: divider - 12, y: 100), to: superview)
+        XCTAssertFalse(split.hitTest(away) === split)
+    }
+
+    /// The first drag on an inactive window used to be spent activating the app,
+    /// so the divider looked like it would not move at all.
+    func testDividerAcceptsTheClickThatActivatesTheWindow() throws {
+        let split = try makeSplitView()
+        XCTAssertTrue(split.acceptsFirstMouse(for: nil))
+    }
+}
