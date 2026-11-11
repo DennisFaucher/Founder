@@ -469,6 +469,63 @@ final class MetadataRefreshTests: XCTestCase {
     }
 }
 
+final class FounderColorThemeTests: XCTestCase {
+    private func makeDefaults() -> (UserDefaults, String) {
+        let suite = "FounderColorThemeTests-\(UUID().uuidString)"
+        return (UserDefaults(suiteName: suite)!, suite)
+    }
+
+    func testCustomColorsRoundTripThroughUserDefaults() {
+        let (defaults, suite) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let theme = FounderColorTheme(
+            folder: NSColor(srgbRed: 0.2, green: 0.4, blue: 0.6, alpha: 1),
+            background: NSColor(srgbRed: 0.1, green: 0.2, blue: 0.3, alpha: 1),
+            text: NSColor(srgbRed: 0.8, green: 0.7, blue: 0.6, alpha: 1),
+            isCustom: true
+        )
+        theme.save(to: defaults)
+
+        let loaded = FounderColorTheme.load(from: defaults)
+        XCTAssertTrue(loaded.isCustom)
+        XCTAssertEqual(loaded.folder.usingColorSpace(.sRGB)?.redComponent ?? -1, 0.2, accuracy: 0.001)
+        XCTAssertEqual(loaded.background.usingColorSpace(.sRGB)?.greenComponent ?? -1, 0.2, accuracy: 0.001)
+        XCTAssertEqual(loaded.text.usingColorSpace(.sRGB)?.blueComponent ?? -1, 0.6, accuracy: 0.001)
+    }
+
+    func testResetRemovesSavedColorsAndRestoresSystemDefaults() {
+        let (defaults, suite) = makeDefaults()
+        defer { defaults.removePersistentDomain(forName: suite) }
+        FounderColorTheme(folder: .systemRed, background: .black, text: .white, isCustom: true).save(to: defaults)
+
+        FounderColorTheme.reset(in: defaults)
+        let loaded = FounderColorTheme.load(from: defaults)
+
+        XCTAssertFalse(loaded.isCustom)
+        XCTAssertNotNil(loaded.folder)
+        XCTAssertNotNil(loaded.background)
+        XCTAssertNotNil(loaded.text)
+    }
+
+    func testFolderIconTintUsesTheFolderColor() throws {
+        let source = NSImage(size: NSSize(width: 8, height: 8))
+        source.lockFocus()
+        NSColor.white.setFill()
+        NSBezierPath(rect: NSRect(x: 0, y: 0, width: 8, height: 8)).fill()
+        source.unlockFocus()
+
+        let tint = NSColor(srgbRed: 0.65, green: 0.35, blue: 0.85, alpha: 1)
+        let result = tintedFolderIcon(source, color: tint)
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(data: XCTUnwrap(result.tiffRepresentation)))
+        let pixel = try XCTUnwrap(bitmap.colorAt(x: 4, y: 4)?.usingColorSpace(.sRGB))
+
+        XCTAssertGreaterThan(pixel.blueComponent, pixel.redComponent)
+        XCTAssertGreaterThan(pixel.redComponent, pixel.greenComponent)
+        XCTAssertGreaterThan(pixel.alphaComponent, 0.9)
+    }
+}
+
 final class FinderFavoritesPlanTests: XCTestCase {
     func testAddsWhatFinderIsMissingInFoundersOrder() {
         let plan = FinderFavoritesPlan.make(

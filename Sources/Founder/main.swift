@@ -18,6 +18,174 @@ enum PasteboardTypes {
     static let favoriteRow = NSPasteboard.PasteboardType("com.dennisfaucher.founder.favoriteRow")
 }
 
+/// The small set of colors Founder lets the user customize. Color components
+/// are stored as device-independent sRGB values so the system color picker and
+/// UserDefaults agree across launches.
+struct FounderColorTheme {
+    var folder: NSColor
+    var background: NSColor
+    var text: NSColor
+    var isCustom: Bool
+
+    private static let keys = ["themeFolderColor", "themeBackgroundColor", "themeTextColor"]
+
+    static func defaults() -> FounderColorTheme {
+        FounderColorTheme(folder: .labelColor, background: .windowBackgroundColor, text: .labelColor, isCustom: false)
+    }
+
+    static func load(from defaults: UserDefaults = .standard) -> FounderColorTheme {
+        guard let folder = color(forKey: keys[0], defaults: defaults),
+              let background = color(forKey: keys[1], defaults: defaults),
+              let text = color(forKey: keys[2], defaults: defaults) else {
+            return .defaults()
+        }
+        return FounderColorTheme(folder: folder, background: background, text: text, isCustom: true)
+    }
+
+    func save(to defaults: UserDefaults = .standard) {
+        defaults.set(components(of: folder), forKey: Self.keys[0])
+        defaults.set(components(of: background), forKey: Self.keys[1])
+        defaults.set(components(of: text), forKey: Self.keys[2])
+    }
+
+    static func reset(in defaults: UserDefaults = .standard) {
+        keys.forEach(defaults.removeObject(forKey:))
+    }
+
+    private static func color(forKey key: String, defaults: UserDefaults) -> NSColor? {
+        guard let values = defaults.array(forKey: key) as? [Double], values.count == 4 else { return nil }
+        return NSColor(
+            srgbRed: CGFloat(values[0]),
+            green: CGFloat(values[1]),
+            blue: CGFloat(values[2]),
+            alpha: CGFloat(values[3])
+        )
+    }
+
+    private func components(of color: NSColor) -> [Double] {
+        guard let rgb = color.usingColorSpace(.sRGB) else { return [0, 0, 0, 1] }
+        return [Double(rgb.redComponent), Double(rgb.greenComponent), Double(rgb.blueComponent), Double(rgb.alphaComponent)]
+    }
+}
+
+/// Applies a solid tint to the visible pixels of a folder icon while retaining
+/// its original transparency.
+func tintedFolderIcon(_ image: NSImage, color: NSColor) -> NSImage {
+    let tinted = NSImage(size: image.size)
+    tinted.lockFocus()
+    let bounds = NSRect(origin: .zero, size: image.size)
+    image.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1)
+    NSGraphicsContext.saveGraphicsState()
+    NSGraphicsContext.current?.compositingOperation = .sourceAtop
+    color.set()
+    NSBezierPath(rect: bounds).fill()
+    NSGraphicsContext.restoreGraphicsState()
+    tinted.unlockFocus()
+    tinted.isTemplate = false
+    return tinted
+}
+
+/// Three independent color choices backed by the standard macOS color panel.
+/// Keeping the values here avoids coupling the colors to NSColorWell's shared
+/// panel state.
+final class ThemeColorPickerAccessory: NSView {
+    private enum Choice { case folder, background, text }
+
+    private(set) var folderColor: NSColor
+    private(set) var backgroundColor: NSColor
+    private(set) var textColor: NSColor
+    private var activeChoice: Choice = .folder
+    private let folderSwatch = NSView()
+    private let backgroundSwatch = NSView()
+    private let textSwatch = NSView()
+    private var colorObserver: NSObjectProtocol?
+
+    init(theme: FounderColorTheme) {
+        folderColor = theme.folder
+        backgroundColor = theme.background
+        textColor = theme.text
+        super.init(frame: NSRect(x: 0, y: 0, width: 290, height: 108))
+
+        addRow("Folder color", y: 76, swatch: folderSwatch, action: #selector(chooseFolderColor))
+        addRow("Background color", y: 42, swatch: backgroundSwatch, action: #selector(chooseBackgroundColor))
+        addRow("Text color", y: 8, swatch: textSwatch, action: #selector(chooseTextColor))
+        updateSwatches()
+        colorObserver = NotificationCenter.default.addObserver(
+            forName: NSColorPanel.colorDidChangeNotification,
+            object: NSColorPanel.shared,
+            queue: .main
+        ) { [weak self] _ in
+            self?.colorPanelChanged()
+        }
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    private func addRow(_ title: String, y: CGFloat, swatch: NSView, action: Selector) {
+        let label = NSTextField(labelWithString: title)
+        label.frame = NSRect(x: 0, y: y, width: 122, height: 24)
+        addSubview(label)
+
+        swatch.frame = NSRect(x: 132, y: y + 2, width: 28, height: 20)
+        swatch.wantsLayer = true
+        swatch.layer?.cornerRadius = 4
+        swatch.layer?.borderWidth = 1
+        swatch.layer?.borderColor = NSColor.separatorColor.cgColor
+        addSubview(swatch)
+
+        let button = NSButton(title: "Choose…", target: self, action: action)
+        button.frame = NSRect(x: 174, y: y - 1, width: 88, height: 26)
+        button.bezelStyle = .rounded
+        button.controlSize = .small
+        addSubview(button)
+    }
+
+    @objc private func chooseFolderColor() { showColorPanel(for: .folder) }
+    @objc private func chooseBackgroundColor() { showColorPanel(for: .background) }
+    @objc private func chooseTextColor() { showColorPanel(for: .text) }
+
+    private func showColorPanel(for choice: Choice) {
+        activeChoice = choice
+        let panel = NSColorPanel.shared
+        panel.color = color(for: choice)
+        panel.isContinuous = true
+        panel.worksWhenModal = true
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func colorPanelChanged() {
+        let selectedColor = NSColorPanel.shared.color
+        switch activeChoice {
+        case .folder: folderColor = selectedColor
+        case .background: backgroundColor = selectedColor
+        case .text: textColor = selectedColor
+        }
+        updateSwatches()
+    }
+
+    func closeColorPanel() {
+        NSColorPanel.shared.orderOut(nil)
+        if let colorObserver {
+            NotificationCenter.default.removeObserver(colorObserver)
+            self.colorObserver = nil
+        }
+    }
+
+    private func color(for choice: Choice) -> NSColor {
+        switch choice {
+        case .folder: folderColor
+        case .background: backgroundColor
+        case .text: textColor
+        }
+    }
+
+    private func updateSwatches() {
+        folderSwatch.layer?.backgroundColor = folderColor.cgColor
+        backgroundSwatch.layer?.backgroundColor = backgroundColor.cgColor
+        textSwatch.layer?.backgroundColor = textColor.cgColor
+    }
+}
+
 // MARK: - Fuzzy search (fzf-style)
 
 struct FuzzyMatch {
@@ -299,6 +467,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
     var favoritesDataSource: FavoritesDataSource!
     var fileTreeDataSource: FileTreeDataSource!
+    var colorTheme = FounderColorTheme.load()
 
     var showHiddenItem: NSMenuItem!
     var finderFavoritesSyncItem: NSMenuItem!
@@ -448,7 +617,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         favoritesListView.allowsEmptySelection = true
         favoritesListView.headerView = nil
         favoritesListView.rowHeight = 24
-        favoritesListView.backgroundColor = .windowBackgroundColor
+        favoritesListView.backgroundColor = colorTheme.background
         favoritesListView.tag = favoritesPaneTag
 
         let column = NSTableColumn(identifier: .init("name"))
@@ -457,6 +626,9 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         favoritesListView.addTableColumn(column)
 
         favoritesDataSource = FavoritesDataSource()
+        favoritesDataSource.folderIconColor = colorTheme.folder
+        favoritesDataSource.textColor = colorTheme.text
+        favoritesDataSource.usesCustomColors = colorTheme.isCustom
         favoritesDataSource.onSelect = { [weak self] path in
             self?.navigateTo(path: path)
         }
@@ -495,7 +667,8 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         fileTreeTableView.allowsMultipleSelection = true
         fileTreeTableView.allowsEmptySelection = true
         fileTreeTableView.rowHeight = 24
-        fileTreeTableView.usesAlternatingRowBackgroundColors = true
+        fileTreeTableView.usesAlternatingRowBackgroundColors = !colorTheme.isCustom
+        fileTreeTableView.backgroundColor = colorTheme.background
         fileTreeTableView.allowsColumnReordering = false
         fileTreeTableView.allowsColumnResizing = true
         fileTreeTableView.tag = fileTreePaneTag
@@ -522,11 +695,17 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         fileTreeTableView.addTableColumn(dateColumn)
 
         fileTreeDataSource = FileTreeDataSource()
+        fileTreeDataSource.folderIconColor = colorTheme.folder
+        fileTreeDataSource.textColor = colorTheme.text
+        fileTreeDataSource.usesCustomColors = colorTheme.isCustom
         fileTreeDataSource.owningTableView = fileTreeTableView
         fileTreeTableView.dataSource = fileTreeDataSource
         fileTreeTableView.delegate = fileTreeDataSource
         fileTreeTableView.sortDescriptors = [fileTreeDataSource.currentSortDescriptor]
         fileTreeDataSource.updateHeaderTitles(fileTreeTableView)
+        for column in fileTreeTableView.tableColumns {
+            column.headerCell.textColor = colorTheme.text
+        }
         fileTreeTableView.doubleAction = #selector(openDoubleClickedRow)
         fileTreeTableView.target = self
         fileTreeTableView.registerForDraggedTypes([.fileURL, .string])
@@ -1036,6 +1215,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
             keyEquivalent: ""
         )
         finderFavoritesSyncItem.state = isFinderFavoritesSyncEnabled ? .on : .off
+        viewMenu.addItem(withTitle: "Choose Colors…", action: #selector(chooseColors), keyEquivalent: "")
         let viewMenuTopItem = NSMenuItem(title: "View", action: nil, keyEquivalent: "")
         viewMenuTopItem.submenu = viewMenu
         menubar.addItem(viewMenuTopItem)
@@ -1695,6 +1875,68 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
 
     // MARK: Actions — View & Go
 
+    @objc func chooseColors() {
+        let accessory = ThemeColorPickerAccessory(theme: colorTheme)
+
+        let alert = NSAlert()
+        alert.messageText = "Choose Colors"
+        alert.informativeText = "Pick colors for folders and the file list. Changes are saved for future launches."
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "Apply")
+        alert.addButton(withTitle: "Use Defaults")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        accessory.closeColorPanel()
+        switch response {
+        case .alertFirstButtonReturn:
+            colorTheme = FounderColorTheme(
+                folder: accessory.folderColor,
+                background: accessory.backgroundColor,
+                text: accessory.textColor,
+                isCustom: true
+            )
+            colorTheme.save()
+            applyColorTheme()
+        case .alertSecondButtonReturn:
+            FounderColorTheme.reset()
+            colorTheme = .defaults()
+            applyColorTheme()
+        default:
+            break
+        }
+    }
+
+    /// Updates the two tables and redraws their cells without changing the
+    /// selected files or favorite.
+    private func applyColorTheme() {
+        let selectedFiles = selectedFileURLs
+        let selectedFavorite = favoritesListView.selectedRow
+
+        favoritesListView.backgroundColor = colorTheme.background
+        favoritesDataSource.folderIconColor = colorTheme.folder
+        favoritesDataSource.textColor = colorTheme.text
+        favoritesDataSource.usesCustomColors = colorTheme.isCustom
+        let favoriteSelectionHandler = favoritesDataSource.onSelect
+        favoritesDataSource.onSelect = nil
+        favoritesListView.reloadData()
+        if favoritesDataSource.favorites.indices.contains(selectedFavorite) {
+            favoritesListView.selectRowIndexes(IndexSet(integer: selectedFavorite), byExtendingSelection: false)
+        }
+        favoritesDataSource.onSelect = favoriteSelectionHandler
+
+        fileTreeTableView.backgroundColor = colorTheme.background
+        fileTreeTableView.usesAlternatingRowBackgroundColors = !colorTheme.isCustom
+        fileTreeDataSource.folderIconColor = colorTheme.folder
+        fileTreeDataSource.textColor = colorTheme.text
+        fileTreeDataSource.usesCustomColors = colorTheme.isCustom
+        for column in fileTreeTableView.tableColumns {
+            column.headerCell.textColor = colorTheme.text
+        }
+        fileTreeTableView.reloadData()
+        selectFileURLs(selectedFiles)
+    }
+
     @objc func toggleShowHidden() {
         fileTreeDataSource.showHidden.toggle()
         showHiddenItem.title = fileTreeDataSource.showHidden ? "Hide Hidden Files" : "Show Hidden Files"
@@ -2002,6 +2244,9 @@ enum FinderFavoritesList {
 
 class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var favorites: [FavoriteEntry] = []
+    var folderIconColor: NSColor = .labelColor
+    var textColor: NSColor = .labelColor
+    var usesCustomColors = false
     var onSelect: ((String) -> Void)?
     var onFilesDropped: ((URL, [URL], Bool) -> Void)?
     /// Fired after any change to the list (add, remove, reorder, indent, drop),
@@ -2158,8 +2403,16 @@ class FavoritesDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate 
         }
 
         cell.textField?.stringValue = displayName(at: row)
+        cell.textField?.textColor = textColor
         let expanded = (favorites[row].path as NSString).expandingTildeInPath
-        cell.imageView?.image = NSWorkspace.shared.icon(forFile: expanded)
+        let icon = NSWorkspace.shared.icon(forFile: expanded)
+        var isDirectory: ObjCBool = false
+        let isFolder = FileManager.default.fileExists(atPath: expanded, isDirectory: &isDirectory)
+            && isDirectory.boolValue
+            && !isPackage(URL(fileURLWithPath: expanded))
+        cell.imageView?.image = usesCustomColors && isFolder
+            ? tintedFolderIcon(icon, color: folderIconColor)
+            : icon
         cell.imageView?.frame.size = NSSize(width: 16, height: 16)
 
         // Indent nested favorites.
@@ -2271,6 +2524,9 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     var currentDirectory: URL
     var entries: [URL] = []
     var entryIsDirectory: [Bool] = []
+    var folderIconColor: NSColor = .labelColor
+    var textColor: NSColor = .labelColor
+    var usesCustomColors = false
     var showHidden = false
     var attributeCache: [URL: [FileAttributeKey: Any]] = [:]
     var filterQuery: String = ""
@@ -2606,7 +2862,13 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
 
     /// Renders `name` with the characters the query matched emphasised, mapping
     /// the matcher's character offsets onto UTF-16 ranges for the attributed string.
-    func highlightedName(_ name: String, positions: [Int], color: NSColor, font: NSFont?) -> NSAttributedString {
+    func highlightedName(
+        _ name: String,
+        positions: [Int],
+        color: NSColor,
+        font: NSFont?,
+        highlightColor: NSColor = .controlAccentColor
+    ) -> NSAttributedString {
         let baseFont = font ?? .systemFont(ofSize: NSFont.systemFontSize)
         let highlighted = Set(positions)
         // An attributed string brings its own paragraph style, and without one the
@@ -2624,7 +2886,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
         for (index, character) in name.enumerated() {
             if highlighted.contains(index) {
                 let range = NSRange(location: offset, length: character.utf16.count)
-                attributed.addAttribute(.foregroundColor, value: NSColor.controlAccentColor, range: range)
+                attributed.addAttribute(.foregroundColor, value: highlightColor, range: range)
                 attributed.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: baseFont.pointSize), range: range)
             }
             offset += character.utf16.count
@@ -2813,19 +3075,20 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                 ])
             }
 
-            let color: NSColor
-            if isDir {
-                color = .labelColor
-            } else if url.pathExtension.isEmpty {
-                color = .secondaryLabelColor
-            } else {
-                color = .labelColor
-            }
+            let color = usesCustomColors
+                ? textColor
+                : (url.pathExtension.isEmpty ? NSColor.secondaryLabelColor : NSColor.labelColor)
             cell.textField?.textColor = color
             let name = displayName(for: url)
             if let positions = matchPositions[url], !positions.isEmpty,
                let textField = cell.textField {
-                textField.attributedStringValue = highlightedName(name, positions: positions, color: color, font: textField.font)
+                textField.attributedStringValue = highlightedName(
+                    name,
+                    positions: positions,
+                    color: color,
+                    font: textField.font,
+                    highlightColor: usesCustomColors ? textColor : .controlAccentColor
+                )
             } else {
                 cell.textField?.stringValue = name
             }
@@ -2833,7 +3096,10 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             if let thumbnail = thumbnail(for: url, isDir: isDir) {
                 cell.imageView?.image = thumbnail
             } else {
-                cell.imageView?.image = NSWorkspace.shared.icon(forFile: url.path)
+                let icon = NSWorkspace.shared.icon(forFile: url.path)
+                cell.imageView?.image = usesCustomColors && isDir
+                    ? tintedFolderIcon(icon, color: folderIconColor)
+                    : icon
             }
             return cell
 
@@ -2872,6 +3138,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
                     countStyle: .file
                 )
             }
+            if usesCustomColors { cell.textField?.textColor = textColor }
             return cell
 
         case "date":
@@ -2907,6 +3174,7 @@ class FileTreeDataSource: NSObject, NSTableViewDataSource, NSTableViewDelegate {
             } else {
                 cell.textField?.stringValue = ""
             }
+            if usesCustomColors { cell.textField?.textColor = textColor }
             return cell
 
         default:
