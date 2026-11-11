@@ -377,6 +377,16 @@ final class PathBarTests: XCTestCase {
         XCTAssertEqual(delegate.pathControl.toolTip, deepPath.path)
     }
 
+    func testShortenedPathComponentsUseFolderIcons() throws {
+        let delegate = try makeApp()
+        delegate.updatePathBar(to: deepPath)
+        let folderIcon = try XCTUnwrap(NSImage(named: NSImage.folderName))
+        XCTAssertEqual(delegate.pathControl.pathItems.count, 4) // root, ellipsis, and two folders
+        for item in delegate.pathControl.pathItems {
+            XCTAssertTrue(item.image?.isEqual(folderIcon) == true)
+        }
+    }
+
     func testShortPathIsShownWhole() throws {
         let delegate = try makeApp()
         let home = URL(fileURLWithPath: "/Users/faucherd")

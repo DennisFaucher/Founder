@@ -860,13 +860,15 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         if pathBarComponents.count > shown {
             let tail = pathBarComponents.suffix(shown)
             pathControl.url = URL(fileURLWithPath: "/" + ([Self.pathBarEllipsis] + tail).joined(separator: "/"))
-            // "/…" is not a real path, so AppKit gives that component a document
-            // icon; it stands for folders, so draw a folder.
-            for cell in pathControl.pathItems where cell.url?.lastPathComponent == Self.pathBarEllipsis {
-                cell.image = NSImage(named: NSImage.folderName)
-            }
         } else {
             pathControl.url = url
+        }
+        // The shortened path uses synthetic components, and AppKit can give both
+        // those and real folders document-style icons. Every item in this bar
+        // represents a folder, so make their icons consistent.
+        let folderIcon = NSImage(named: NSImage.folderName)
+        for item in pathControl.pathItems {
+            item.image = folderIcon
         }
         pathControl.toolTip = url.path
     }
