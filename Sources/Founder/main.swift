@@ -368,6 +368,28 @@ func isPackage(_ url: URL) -> Bool {
     return (try? resolved.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
 }
 
+/// Sidebar table. Clicking the row that is already selected posts no selection
+/// change, so `onReselect` reports that click and lets the sidebar navigate
+/// back to the favorite (e.g. after drilling into a subfolder).
+class FavoritesTableView: NSTableView {
+    var onReselect: ((Int) -> Void)?
+    private var rowSelectedAtMouseDown = -1
+
+    override func mouseDown(with event: NSEvent) {
+        rowSelectedAtMouseDown = selectedRow
+        super.mouseDown(with: event)
+    }
+
+    /// Called from the table's click action (not sent for drags).
+    func handleClick() {
+        let row = clickedRow
+        if row >= 0, row == rowSelectedAtMouseDown, row == selectedRow {
+            onReselect?(row)
+        }
+        rowSelectedAtMouseDown = -1
+    }
+}
+
 class FileTreeTableView: NSTableView {
     var onQuickLook: (() -> Void)?
 
@@ -462,7 +484,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
                            QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     var window: NSWindow!
     var splitView: NSSplitView!
-    var favoritesListView: NSTableView!
+    var favoritesListView: FavoritesTableView!
     var fileTreeTableView: FileTreeTableView!
 
     var favoritesDataSource: FavoritesDataSource!
@@ -611,7 +633,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         scrollView.hasVerticalScroller = true
         scrollView.borderType = .noBorder
 
-        favoritesListView = NSTableView(frame: view.bounds)
+        favoritesListView = FavoritesTableView(frame: view.bounds)
         favoritesListView.autoresizingMask = [.width]
         favoritesListView.allowsMultipleSelection = false
         favoritesListView.allowsEmptySelection = true
@@ -631,6 +653,13 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         favoritesDataSource.usesCustomColors = colorTheme.isCustom
         favoritesDataSource.onSelect = { [weak self] path in
             self?.navigateTo(path: path)
+        }
+        favoritesListView.target = self
+        favoritesListView.action = #selector(favoritesClicked(_:))
+        favoritesListView.onReselect = { [weak self] row in
+            guard let self, let favorites = self.favoritesDataSource?.favorites,
+                  favorites.indices.contains(row) else { return }
+            self.navigateTo(path: favorites[row].path)
         }
         favoritesDataSource.onFilesDropped = { [weak self] destination, urls, isMove in
             self?.moveDroppedFiles(urls, into: destination, isMove: isMove)
@@ -1012,6 +1041,10 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
            !fileTreeDataSource.filterQuery.isEmpty {
             performSearch()
         }
+    }
+
+    @objc func favoritesClicked(_ sender: Any?) {
+        favoritesListView.handleClick()
     }
 
     @objc func recursiveToggled(_ sender: NSButton) {
