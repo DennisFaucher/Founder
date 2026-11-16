@@ -368,6 +368,42 @@ func isPackage(_ url: URL) -> Bool {
     return (try? resolved.resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false
 }
 
+/// Cloud placeholders ("dataless" files) from File Provider services such as
+/// OneDrive. Opening one hands the app an empty stub while the provider
+/// downloads in the background, so callers materialize it first.
+enum CloudStub {
+    private static let datalessFlag: UInt32 = 0x4000_0000   // SF_DATALESS
+
+    static func isDataless(_ url: URL) -> Bool {
+        var info = stat()
+        guard lstat(url.path, &info) == 0 else { return false }
+        // Directories are listed without content; only files need downloading.
+        guard (info.st_mode & S_IFMT) == S_IFREG else { return false }
+        return info.st_flags & datalessFlag != 0
+    }
+
+    /// Blocks until the file's content is local. A coordinated read makes the
+    /// provider materialize the file; reading a byte is the fallback if the
+    /// file is still a stub afterwards. Call off the main thread.
+    static func materialize(_ url: URL) -> Error? {
+        var coordinationError: NSError?
+        var readError: Error?
+        NSFileCoordinator(filePresenter: nil).coordinate(
+            readingItemAt: url, options: .withoutChanges, error: &coordinationError
+        ) { readURL in
+            do {
+                let handle = try FileHandle(forReadingFrom: readURL)
+                defer { try? handle.close() }
+                _ = try handle.read(upToCount: 1)
+            } catch {
+                readError = error
+            }
+        }
+        if let error = coordinationError ?? readError { return error }
+        return isDataless(url) ? CocoaError(.fileReadUnknown) : nil
+    }
+}
+
 /// Sidebar table. Clicking the row that is already selected posts no selection
 /// change, so `onReselect` reports that click and lets the sidebar navigate
 /// back to the favorite (e.g. after drilling into a subfolder).
@@ -485,6 +521,8 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
     var window: NSWindow!
     var splitView: NSSplitView!
     var favoritesListView: FavoritesTableView!
+    /// Paths of cloud stubs currently being downloaded before opening.
+    var downloadingPaths = Set<String>()
     var fileTreeTableView: FileTreeTableView!
 
     var favoritesDataSource: FavoritesDataSource!
@@ -1057,7 +1095,7 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return }
         guard isDir.boolValue, !isPackage(url) else {
-            NSWorkspace.shared.open(url)
+            downloadStubs(in: [url]) { NSWorkspace.shared.open(url) }
             return
         }
 
@@ -1082,6 +1120,51 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         updatePathBar(to: url)
         window.title = "Founder — " + (url.lastPathComponent.isEmpty ? url.path : url.lastPathComponent)
         updateGoBackItem()
+    }
+
+    // MARK: Cloud stubs
+
+    /// Makes sure every cloud placeholder in `urls` is downloaded, then runs
+    /// `action` on the main thread. Without stubs it runs immediately.
+    func downloadStubs(in urls: [URL], then action: @escaping () -> Void) {
+        let stubs = urls.filter { CloudStub.isDataless($0) && !downloadingPaths.contains($0.path) }
+        guard !stubs.isEmpty else {
+            // Already downloading elsewhere: ignore the repeat request.
+            if urls.contains(where: { downloadingPaths.contains($0.path) }) { return }
+            action()
+            return
+        }
+
+        downloadingPaths.formUnion(stubs.map(\.path))
+        searchSpinner.isHidden = false
+        cancelSearchButton.isHidden = true
+        searchStatusLabel.textColor = .secondaryLabelColor
+        searchStatusLabel.stringValue = stubs.count == 1
+            ? "Downloading \(stubs[0].lastPathComponent)…"
+            : "Downloading \(stubs.count) files…"
+        searchStatusView.isHidden = false
+        searchStatusHeightConstraint.constant = 20
+        searchSpinner.startAnimation(nil)
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var failure: (URL, Error)?
+            for url in stubs {
+                if let error = CloudStub.materialize(url) {
+                    failure = (url, error)
+                    break
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.downloadingPaths.subtract(stubs.map(\.path))
+                if self.downloadingPaths.isEmpty { self.hideSearchStatus() }
+                if let (url, error) = failure {
+                    self.presentError("Could not download \(url.lastPathComponent): \(error.localizedDescription)")
+                } else {
+                    action()
+                }
+            }
+        }
     }
 
     func navigateTo(path: String) {
@@ -1112,7 +1195,10 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
         if panel.isVisible {
             panel.orderOut(nil)
         } else if !selectedFileURLs.isEmpty {
-            panel.makeKeyAndOrderFront(nil)
+            downloadStubs(in: selectedFileURLs) {
+                guard !self.selectedFileURLs.isEmpty else { return }
+                panel.makeKeyAndOrderFront(nil)
+            }
         }
     }
 
@@ -1451,13 +1537,15 @@ class FounderAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSSea
               context.appURL.lastPathComponent)
         let config = NSWorkspace.OpenConfiguration()
         config.activates = true
-        NSWorkspace.shared.open(context.fileURLs, withApplicationAt: context.appURL, configuration: config) { app, error in
-            DispatchQueue.main.async {
-                if let error = error {
-                    NSLog("Open With failed: %@", error.localizedDescription)
-                    self.presentError("Could not open file: \(error.localizedDescription)")
-                } else {
-                    NSLog("Open With success: %@", app?.localizedName ?? "unknown")
+        downloadStubs(in: context.fileURLs) {
+            NSWorkspace.shared.open(context.fileURLs, withApplicationAt: context.appURL, configuration: config) { app, error in
+                DispatchQueue.main.async {
+                    if let error = error {
+                        NSLog("Open With failed: %@", error.localizedDescription)
+                        self.presentError("Could not open file: \(error.localizedDescription)")
+                    } else {
+                        NSLog("Open With success: %@", app?.localizedName ?? "unknown")
+                    }
                 }
             }
         }
